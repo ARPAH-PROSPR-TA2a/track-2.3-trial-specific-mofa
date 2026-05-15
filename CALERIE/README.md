@@ -71,6 +71,15 @@ output_dir <- "D:/R_sessions/PROSPR/MOFA"
 timepoint <- 24
 use_change_scores <- TRUE
 use_groups <- FALSE
+
+use_residuals <- FALSE
+covariates <- data.frame(
+  var_names = character(0),
+  is_factor = logical(0),
+  stringsAsFactors = FALSE
+)
+use_parallel_residualization <- TRUE
+n_residualization_cores <- max(1, parallel::detectCores() - 1)
 ```
 
 ### Configuration options
@@ -82,26 +91,85 @@ use_groups <- FALSE
 | `timepoint` | Follow-up visit to analyze, `12` or `24` months. Samples are selected using `fumo == timepoint`. |
 | `use_change_scores` | If `TRUE`, each omics value is converted to a change score: target visit minus baseline. If `FALSE`, the script uses target-visit values directly. |
 | `use_groups` | If `TRUE`, the MOFA model treats the AL and CR arms as separate MOFA groups. If `FALSE`, all samples are analyzed together without MOFA grouping. |
+| `use_residuals` | If `TRUE`, residualizes each omics data matrix against selected phenotype covariates before any downstream derivations such as change-score calculation or timepoint extraction. The default is `FALSE`. |
+| `covariates` | A two-column data frame specifying phenotype covariates to use for residualization. `covariates$var_names` must contain column names from the phenotype table loaded from `calerie_clin_fn`; `covariates$is_factor` indicates whether each covariate should be coerced to a factor before residualization. |
+| `use_parallel_residualization` | If `TRUE`, uses parallel feature-wise residualization when missing omics values prevent fully vectorized residualization. |
+| `n_residualization_cores` | Number of worker processes to use for parallel residualization. |
+
+### Optional residualization of omics data
+
+The MOFA script can optionally residualize each omics matrix before the matrices are used in downstream calculations. This is controlled by:
+
+```r
+use_residuals <- FALSE
+
+covariates <- data.frame(
+  var_names = character(0),
+  is_factor = logical(0),
+  stringsAsFactors = FALSE
+)
+```
+
+When `use_residuals` is `FALSE`, no residualization is performed and the analysis proceeds as usual.
+
+When `use_residuals` is `TRUE`, each omics matrix is residualized immediately after it is read from file and before downstream derivations such as change-score calculation, timepoint-specific extraction, variance filtering, feature selection, or MOFA model construction. For each omics view, the script:
+
+1. Identifies the barcode column in the phenotype table that corresponds to the omics matrix.
+2. Removes samples from the omics matrix if their barcodes are not present in the phenotype table.
+3. Restricts and orders the phenotype table so that its rows match the remaining omics samples.
+4. Coerces any covariates listed with `is_factor == TRUE` to factors.
+5. Fits a linear model for each omics feature using `covariates$var_names` as regressors.
+6. Replaces the original feature values with residuals from the fitted models.
+
+For example:
+
+```r
+use_residuals <- TRUE
+
+covariates <- data.frame(
+  var_names = c("female", "bmistrat", "deidsite"),
+  is_factor = c(TRUE, TRUE, TRUE),
+  stringsAsFactors = FALSE
+)
+```
+
+In this example, each omics feature is residualized against `female`, `bmistrat`, and `deidsite`, with all three variables treated as categorical predictors. The names in `covariates$var_names` must match column names in the phenotype table read from `calerie_clin_fn`.
+
+If a covariate is numeric but should be modeled categorically, set its corresponding `is_factor` value to `TRUE`. If a covariate should be modeled as a continuous predictor, set `is_factor` to `FALSE`.
+
+The script uses a fast vectorized residualization step when possible. If feature-level missing values require separate models per feature, the script can use parallel residualization controlled by:
+
+```r
+use_parallel_residualization <- TRUE
+n_residualization_cores <- max(1, parallel::detectCores() - 1)
+```
+
+To disable parallel residualization, set:
+
+```r
+use_parallel_residualization <- FALSE
+```
 
 ### What the MOFA script does
 
 `MOFA_analysis_calerie.R` performs the following steps:
 
 1. Sources `resources.R` and `methods.R`.
-2. Reads the phenotype/visit data.
+2. Reads the phenotype/clinical data.
 3. Reads whichever omics files are defined in `resources.R`.
-4. For each available omics view, either:
+4. If `use_residuals == TRUE`, residualizes each omics matrix against the phenotype covariates specified in `covariates`.
+5. For each available omics view, either:
    - computes change scores as `timepoint - baseline`, or
    - extracts values from the selected follow-up timepoint.
-5. Removes zero-variance features.
-6. Drops omics views with no samples at the requested timepoint.
-7. Optionally infers AL/CR group labels from sample IDs.
-8. Filters each omics view to retain highly variable features.
-9. Adds missing sample columns filled with `NA`, as required by MOFA when views have different sample coverage.
-10. Creates and prepares the MOFA object.
-11. Adds sample metadata to the MOFA object using `samples_metadata(mo) <- meta_d`.
-12. Fits the model with `run_mofa()`.
-13. Writes run outputs to a timestamped result folder.
+6. Removes zero-variance features.
+7. Drops omics views with no samples at the requested timepoint.
+8. Optionally infers AL/CR group labels from sample IDs.
+9. Filters each omics view to retain highly variable features.
+10. Adds missing sample columns filled with `NA`, as required by MOFA when views have different sample coverage.
+11. Creates and prepares the MOFA object.
+12. Adds sample metadata to the MOFA object using `samples_metadata(mo) <- meta_d`.
+13. Fits the model with `run_mofa()`.
+14. Writes run outputs to a timestamped result folder.
 
 ### Feature filtering
 
@@ -253,6 +321,8 @@ sapply(res, function(model) exp(coef(model)))
    - `timepoint`
    - `use_change_scores`
    - `use_groups`
+   - `use_residuals`
+   - `covariates`, if residualization is enabled
 3. Run the MOFA analysis.
 4. Locate the resulting `model.hdf5` file in the timestamped output folder.
 5. Edit `mofa_res_fname`, `X`, `Y`, and `categorical` in `regress_mofa_factors.R`.

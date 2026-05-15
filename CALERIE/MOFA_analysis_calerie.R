@@ -18,6 +18,11 @@
 # diet) are modeled as separate MOFA groups. If FALSE, all samples are
 # analyzed together without grouping.
 #
+# If use_residuals is TRUE, then the omics data matrices are residualized
+# using as covariates the columns specified in the variable covariates.
+# Residualization takes place prior to any downstream computations (e.g.,
+# calculation of change scores).
+#
 # The script supports any combination of input data matrices
 # (methylation, proteomics, metabolomics). The file paths for these are
 # defined in resources.R. To exclude a data type, simply comment out the
@@ -37,7 +42,7 @@ library(tidyr)
 ########################################
 #------------ Configure run by setting the values of the variables below
 # Location of source code root directory - modify as needed for your environment
-code_dir <- "D:/git/misc/prospr-fast/CALERIE"
+code_dir <- "D:/git/Belsky/track-2.3-trial-specific-mofa/CALERIE"
 
 # Location of directory where to store results and output - modify as desired
 # for your local run environment
@@ -52,7 +57,36 @@ use_change_scores <- TRUE
 
 # If TRUE, run MOFA with AL and CR as separate groups. If FALSE, do not pass
 # groups to MOFA, so all samples are analyzed together.
-use_groups <- FALSE
+use_groups <- TRUE
+
+# If TRUE, each omics matrix is residualized immediately after it is read from
+# file and before any downstream processing, such as change-score calculation,
+# timepoint extraction, variable-feature filtering, or MOFA object creation.
+use_residuals <- FALSE
+
+# Covariates to use when residualizing omics matrices. The var_names column must
+# contain column names from the phenotypic data table loaded from calerie_clin_fn.
+# The is_factor column indicates whether each variable should be coerced to a
+# factor before residualization. Leave this empty when use_residuals is FALSE.
+covariates <- data.frame(
+		var_names = c("female", "race", "agebl"),
+		is_factor = c(TRUE, TRUE, FALSE),
+		stringsAsFactors = FALSE
+)
+
+# If TRUE, feature-wise residualization is parallelized when the fast matrix-wide
+# residualization path cannot be used. The fast path is still preferred whenever
+# possible because it is usually faster than launching worker processes.
+use_parallel_residualization <- TRUE
+
+# Number of worker processes to use for parallel feature-wise residualization.
+# This leaves one CPU core free when more than one core is available. If R cannot
+# detect the number of cores, the script falls back to serial residualization.
+detected_residualization_cores <- parallel::detectCores(logical = TRUE)
+if (is.na(detected_residualization_cores)){
+	detected_residualization_cores <- 1
+}
+n_residualization_cores <- max(1, detected_residualization_cores - 1)
 #------------------------------------------------------------------------------
 ########################################
 
@@ -91,6 +125,280 @@ getResourceFile <- function(var_name, required = FALSE){
 # Read phenotypic data. This file is required.
 pheno_d <- readPhenoData(getResourceFile("calerie_clin_fn", required = TRUE))
 
+# Validate the residualization settings before any omics tables are loaded. This
+# catches misspelled metadata variables early, rather than after partial work has
+# already been done.
+validateResidualizationInputs <- function(pheno_df, covariates){
+	# No validation is needed when residualization is disabled.
+	if (!use_residuals){
+		return(invisible(TRUE))
+	}
+	
+	# The covariates object must be a data frame with exactly the expected fields.
+	if (!is.data.frame(covariates) ||
+			!all(c("var_names", "is_factor") %in% names(covariates))){
+		stop("When use_residuals is TRUE, covariates must be a data frame with columns 'var_names' and 'is_factor'.")
+	}
+	
+	# At least one covariate is required in order to residualize the omics data.
+	if (nrow(covariates) == 0){
+		stop("use_residuals is TRUE, but no residualization covariates were supplied.")
+	}
+	
+	# Convert user-supplied fields to simple vectors so later checks are reliable.
+	covariates$var_names <- as.character(covariates$var_names)
+	covariates$is_factor <- as.logical(covariates$is_factor)
+	
+	# Missing or duplicated covariate names would make the regression formula
+	# ambiguous, so treat them as configuration errors.
+	if (any(is.na(covariates$var_names) | !nzchar(covariates$var_names))){
+		stop("All entries in covariates$var_names must be non-empty strings.")
+	}
+	if (anyDuplicated(covariates$var_names)){
+		stop("Duplicate entries are not allowed in covariates$var_names.")
+	}
+	if (any(is.na(covariates$is_factor))){
+		stop("All entries in covariates$is_factor must be TRUE or FALSE.")
+	}
+	
+	# Each residualization covariate must be present in the phenotypic table.
+	missing_covariates <- setdiff(covariates$var_names, names(pheno_df))
+	if (length(missing_covariates) > 0){
+		stop("Residualization covariates missing from the phenotype table: ",
+				paste(missing_covariates, collapse = ", "))
+	}
+	
+	invisible(TRUE)
+}
+
+# Escape column names for use in an R formula. This allows residualization to
+# work even if phenotype column names contain spaces or other non-standard
+# characters.
+escapeFormulaName <- function(x){
+	paste0("`", gsub("`", "\\`", x), "`")
+}
+
+# Residualize a single feature vector against a fixed covariate design matrix.
+# This helper is used only when feature-specific missing values prevent the
+# faster matrix-wide residualization path. It returns both residuals and any
+# warning text so parallel workers do not lose diagnostics.
+residualizeOneFeature <- function(feature_idx, data_mat, complete_idx,
+		design_mat, view_name = "omics"){
+	# Extract the values for this feature among samples with complete covariate
+	# information. Feature-specific missing values are handled below.
+	y <- data_mat[feature_idx, complete_idx]
+	fit_idx <- !is.na(y)
+	feature_name <- rownames(data_mat)[feature_idx]
+	if (is.null(feature_name) || is.na(feature_name) || !nzchar(feature_name)){
+		feature_name <- paste0("feature_", feature_idx)
+	}
+	
+	# Initialize this feature's residual vector. Values remain NA for samples that
+	# lack covariates or have missing omics measurements.
+	feature_residuals <- rep(NA_real_, length(complete_idx))
+	
+	# Require enough observations to estimate the linearly independent columns of
+	# the design matrix. Sparse features are left as NA and reported to the caller.
+	if (sum(fit_idx) <= qr(design_mat[fit_idx, , drop = FALSE])$rank){
+		warn_msg <- paste0("Feature '", feature_name, "' in view '", view_name,
+				"' has too few non-missing samples for residualization; ",
+				"setting residuals to NA.")
+		return(list(residuals = feature_residuals, warning = warn_msg))
+	}
+	
+	# lm.fit() is used instead of lm() because the design matrix has already been
+	# constructed once and can be reused for every feature.
+	fit <- lm.fit(design_mat[fit_idx, , drop = FALSE], y[fit_idx])
+	feature_residuals[fit_idx] <- fit$residuals
+	
+	list(residuals = feature_residuals, warning = NA_character_)
+}
+
+# Residualize one omics matrix against the requested phenotype covariates.
+# Rows are features and columns are samples. Column names are matched to the
+# phenotype table through the view-specific barcode column.
+residualizeOmicsMatrix <- function(data_mat, pheno_df, barcode_col, covariates,
+		view_name = "omics"){
+	# Return the original matrix unchanged when residualization is disabled.
+	if (!use_residuals){
+		return(data_mat)
+	}
+	
+	# Ensure the phenotype table contains the barcode column needed for this view.
+	if (!(barcode_col %in% names(pheno_df))){
+		stop("Phenotype table is missing barcode column '", barcode_col,
+				"' required for residualizing view '", view_name, "'.")
+	}
+	
+	# Work with a numeric matrix while preserving feature and sample names.
+	data_mat <- as.matrix(data_mat)
+	storage.mode(data_mat) <- "double"
+	
+	# Remove omics samples that are not present in the phenotype table before
+	# residualization. This prevents unmatched columns from causing a hard error
+	# and ensures that all downstream calculations use the same sample set that
+	# could be adjusted against the requested phenotype covariates.
+	pheno_barcodes <- unique(pheno_df[[barcode_col]])
+	matched_samples <- colnames(data_mat) %in% pheno_barcodes
+	missing_pheno <- colnames(data_mat)[!matched_samples]
+	if (length(missing_pheno) > 0){
+		warning("Removing ", length(missing_pheno), " sample(s) from view '",
+				view_name, "' because they are not present in phenotype barcode column '",
+				barcode_col, "': ", paste(missing_pheno, collapse = ", "))
+		data_mat <- data_mat[, matched_samples, drop = FALSE]
+	}
+	
+	# Stop if no omics samples remain after dropping columns without phenotype
+	# records; without matched samples, no residualization or downstream MOFA
+	# analysis can be performed for this view.
+	if (ncol(data_mat) == 0){
+		stop("No samples remain in view '", view_name,
+				"' after removing samples absent from the phenotype table.")
+	}
+	
+	# Restrict the phenotype table to the retained samples from the omics matrix.
+	# Each omics column is then matched back to exactly one phenotype row using the
+	# barcode column. Base-R subsetting is used here to avoid
+	# non-standard-evaluation issues with a barcode column selected by name.
+	pheno_slice <- pheno_df[pheno_df[[barcode_col]] %in% colnames(data_mat),
+			, drop = FALSE]
+	pheno_slice <- pheno_slice[!duplicated(pheno_slice[[barcode_col]]),
+			, drop = FALSE]
+	pheno_slice <- pheno_slice[match(colnames(data_mat), pheno_slice[[barcode_col]]),
+			, drop = FALSE]
+	
+	# Coerce user-declared categorical covariates to factors before constructing
+	# the regression model matrix.
+	factor_vars <- covariates$var_names[covariates$is_factor]
+	for (var_name in factor_vars){
+		pheno_slice[[var_name]] <- factor(pheno_slice[[var_name]])
+	}
+	
+	# Build a formula containing only the covariates, for example ~ age + sex.
+	# The model matrix created from this formula is reused for every feature.
+	covariate_formula <- as.formula(paste("~",
+					paste(escapeFormulaName(covariates$var_names), collapse = " + ")))
+	model_frame <- model.frame(covariate_formula, data = pheno_slice,
+			na.action = na.pass)
+	
+	# Only samples with complete covariate information can be residualized.
+	complete_covariates <- complete.cases(model_frame)
+	if (sum(complete_covariates) == 0){
+		stop("No complete phenotype rows are available for residualizing view '",
+				view_name, "'.")
+	}
+	
+	# Drop unused factor levels after removing incomplete covariate rows, then make
+	# sure each factor still has at least two observed levels.
+	model_frame_complete <- droplevels(model_frame[complete_covariates,
+					, drop = FALSE])
+	for (var_name in factor_vars){
+		if (var_name %in% names(model_frame_complete) &&
+				length(levels(model_frame_complete[[var_name]])) < 2){
+			stop("Categorical residualization covariate '", var_name,
+					"' has fewer than two observed levels in view '", view_name, "'.")
+		}
+	}
+	
+	# Construct the design matrix for the complete-covariate samples. R handles
+	# numeric covariates as continuous variables and factor covariates through the
+	# usual contrast/dummy-variable coding.
+	design_mat <- model.matrix(covariate_formula, data = model_frame_complete)
+	complete_idx <- which(complete_covariates)
+	
+	# Initialize the output with NA values. Samples with missing covariates or
+	# missing feature values remain NA because no residual can be estimated there.
+	residualized_mat <- data_mat
+	residualized_mat[,] <- NA_real_
+	
+	# Extract the complete-covariate part of the omics matrix once. If this matrix
+	# has no missing values, all features can be residualized in a single lm.fit()
+	# call. This vectorized path is usually faster than any feature-wise loop, even
+	# a parallelized one.
+	data_complete <- data_mat[, complete_idx, drop = FALSE]
+	if (!anyNA(data_complete)){
+		# lm.fit() accepts a response matrix with samples in rows and features in
+		# columns. Its residual matrix therefore needs to be transposed back to the
+		# original feature-by-sample orientation.
+		if (nrow(design_mat) <= qr(design_mat)$rank){
+			warning("View '", view_name,
+					"' has too few complete samples for residualization; setting residuals to NA.")
+		} else {
+			message("Residualizing ", view_name,
+					" with matrix-wide lm.fit() because no omics values are missing.")
+			fit <- lm.fit(design_mat, t(data_complete))
+			residualized_mat[, complete_idx] <- t(fit$residuals)
+		}
+	} else {
+		# Missing omics values require feature-specific fits, because each feature may
+		# use a different subset of samples. These independent fits can be executed in
+		# parallel when requested.
+		feature_indices <- seq_len(nrow(data_mat))
+		
+		if (use_parallel_residualization && length(feature_indices) > 1 &&
+				n_residualization_cores > 1){
+			# Limit the number of workers to the number of features to avoid launching
+			# idle processes for small matrices. PSOCK clusters are used because they are
+			# portable across Windows, macOS, and Linux.
+			n_workers <- min(n_residualization_cores, length(feature_indices))
+			message("Residualizing ", view_name, " feature-wise using ",
+					n_workers, " parallel worker(s).")
+			cl <- parallel::makeCluster(n_workers)
+			on.exit(parallel::stopCluster(cl), add = TRUE)
+			
+			# Export the shared objects once per worker, instead of resending the full
+			# omics matrix with every feature. This is important for large omics tables.
+			parallel::clusterExport(
+					cl,
+					varlist = c("data_mat", "complete_idx", "design_mat",
+							"view_name", "residualizeOneFeature"),
+					envir = environment()
+			)
+			
+			residual_list <- parallel::parLapply(
+					cl,
+					X = feature_indices,
+					fun = function(feature_idx){
+						residualizeOneFeature(feature_idx, data_mat, complete_idx,
+								design_mat, view_name)
+					}
+			)
+		} else {
+			# Serial fallback used when parallelization is disabled, only one core is
+			# available, or the matrix has only one feature.
+			residual_list <- lapply(
+					feature_indices,
+					residualizeOneFeature,
+					data_mat = data_mat,
+					complete_idx = complete_idx,
+					design_mat = design_mat,
+					view_name = view_name
+			)
+		}
+		
+		# Emit warnings collected from serial or parallel feature-wise fits. Returning
+		# warning text explicitly avoids losing worker diagnostics from parLapply().
+		warn_msgs <- unique(na.omit(vapply(residual_list, `[[`, character(1),
+								"warning")))
+		for (warn_msg in warn_msgs){
+			warning(warn_msg)
+		}
+		
+		# Convert the list of residual vectors back into a feature-by-sample matrix
+		# and store it in the complete-covariate sample columns.
+		residualized_complete <- do.call(rbind,
+				lapply(residual_list, `[[`, "residuals"))
+		residualized_mat[, complete_idx] <- residualized_complete
+	}
+	
+	message("Residualized ", view_name, " data using covariates: ",
+			paste(covariates$var_names, collapse = ", "))
+	residualized_mat
+}
+
+# Check the residualization configuration before reading any omics data views.
+validateResidualizationInputs(pheno_d, covariates)
+
 # Definitions for the optional omics data views.
 omics_input_defs <- list(
 		methylation = list(
@@ -125,7 +433,20 @@ for (view_name in names(omics_input_defs)){
 	}
 	
 	message("Reading ", view_name, " data from: ", input_file)
-	loaded_views[[view_name]] <- view_def$reader(input_file)
+	
+	# Read the raw omics matrix from file. Residualization, if enabled, is applied
+	# immediately after this step so every downstream calculation uses adjusted
+	# feature values.
+	view_data <- view_def$reader(input_file)
+	view_data <- residualizeOmicsMatrix(
+			view_data,
+			pheno_d,
+			view_def$barcode_col,
+			covariates,
+			view_name = view_name
+	)
+	
+	loaded_views[[view_name]] <- view_data
 	barcode_cols[view_name] <- view_def$barcode_col
 }
 
@@ -345,10 +666,10 @@ getTopVariableFeatureIndexByGroup <- function(view_data, view_groups,
 	#   - compute the top variable features within that subset
 	# Combine all selected feature indices across groups
 	group_feat_idx <- unlist(lapply(group_names, function(group_name){
-				group_cols <- view_groups == group_name
-				getTopVariableFeatureIndex(view_data[, group_cols, drop = FALSE],
-						max_features)
-			}), use.names = FALSE)
+						group_cols <- view_groups == group_name
+						getTopVariableFeatureIndex(view_data[, group_cols, drop = FALSE],
+								max_features)
+					}), use.names = FALSE)
 	# Take the union of features selected across all groups
 	feat_idx <- unique(group_feat_idx)
 	
@@ -427,7 +748,7 @@ filterMostVariableFeatures <- function(data_views, max_factor=5, groups = NULL,
 					# Ensure all samples have valid group assignments
 					if (any(is.na(view_groups))){
 						stop(paste0("Missing group labels for view '", view_name,
-								"'."))
+										"'."))
 					}
 					# Select top variable features using group-aware method
 					feat_idx <- getTopVariableFeatureIndexByGroup(view_data,
@@ -512,11 +833,11 @@ data_opts$use_float32 <- FALSE
 
 # Set model options.
 model_opts <- get_default_model_options(mdd)
-# model_opts$num_factors <- 10 # If we want to manually set the factor num
+model_opts$num_factors <- 50 # If we want to manually set the factor num
 
 # Set training options.
 train_opts <- get_default_training_options(mdd)
-train_opts$drop_factor_threshold <- 0.01
+train_opts$drop_factor_threshold <- 0.001
 train_opts$convergence_mode <- "slow"
 # increase from default value of 1000, just in case more iters are required 
 # for convergence
@@ -565,13 +886,14 @@ samples_metadata(mo) <- meta_d
 # Also save the output of the MOFA method.
 score_tag <- ifelse(use_change_scores, "change_scores", "timepoint_values")
 group_tag <- ifelse(use_groups, "grouped", "ungrouped")
+resid_tag <- ifelse(use_residuals, "_residualized", "")
 views_tag <- paste(sapply(views_names(mo), function(vn){
 					omics_input_defs[[vn]]$moniker}), 
 		collapse="+")
 res_folder <- paste(output_dir,
 		paste0(format(Sys.time(), "%Y_%b_%d_%H_%M_%S"),
 				"_visit=", timepoint, "mo_", score_tag, "_", group_tag,
-				"_views=", views_tag),
+				resid_tag, "_views=", views_tag),
 		sep = "/")
 res_file <- paste(res_folder, "model.hdf5", sep = "/")
 log_file <- paste(res_folder, "mofa_out.txt", sep = "/")
@@ -597,6 +919,18 @@ score_desc <- if (use_change_scores){
 
 included_views <- paste(names(data_views), collapse = ", ")
 data_notes <- character(0)
+if (use_residuals){
+	# Document the residualization step in the run-specific README so the saved
+	# output folder records that MOFA was fit on adjusted omics matrices.
+	data_notes <- c(data_notes,
+			paste("Before downstream processing, each omics matrix was",
+					"residualized using phenotype covariates:",
+					paste(covariates$var_names, collapse = ", "), "."),
+			paste("Residualization used matrix-wide lm.fit() when possible and",
+					"feature-wise fitting when missing omics values required it;",
+					"parallel feature-wise residualization was",
+					ifelse(use_parallel_residualization, "enabled", "disabled"), "."))
+}
 if ("methylation" %in% names(data_views)){
 	data_notes <- c(data_notes, "Methylation data are reported as M-values.")
 }
