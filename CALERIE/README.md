@@ -13,7 +13,7 @@ The workflow has two main stages:
 |---|---|
 | `resources.R` | Defines local file paths for the CALERIE input files. Edit this file to specify the file locations for your local compute environment. |
 | `MOFA_analysis_calerie.R` | Main MOFA-fitting script. It reads the omics and phenotype files, preprocesses the selected omics views, fits a MOFA model, and writes the fitted model to `model.hdf5`.  |
-| `regress_mofa_factors.R` | Loads a fitted `model.hdf5` file and runs one regression per MOFA factor. The outcome, adjustment covariates, and categorical variables are user-selected near the top of the script. |
+| `regress_mofa_factors.R` | Loads a fitted `model.hdf5` file, runs one regression per MOFA factor, stores the fitted models in `res`, and generates a PDF report summarizing model performance and factor associations. The outcome, adjustment covariates, and categorical variables are user-selected near the top of the script. |
 | `methods.R` | Helper functions sourced by `MOFA_analysis_calerie.R`, including data readers such as `readPhenoData()`, `readMethylation()`, `readProteomics()`, `readMetabolomics()`, and matrix helpers such as `fillEmptyCols()`.  |
 
 ## Required R packages
@@ -246,6 +246,7 @@ categorical <- c(
 | `X` | Character vector of metadata covariates to include in every model. Use `character(0)` for no covariates. |
 | `Y` | Name of the metadata column to use as the dependent variable. This will typically be `"CR"`|
 | `categorical` | Metadata columns that should be treated as categorical variables. Include `Y` here when the outcome should be modeled using logistic regression. |
+| `regression_report_fname` | Output path for the PDF regression report. By default, this is written next to `model.hdf5`, and the filename includes the outcome `Y` and the covariates in `X`. |
 
 ### Model fitted by the regression script
 
@@ -312,6 +313,38 @@ For logistic regression, coefficients are on the log-odds scale. Exponentiate co
 sapply(res, function(model) exp(coef(model)))
 ```
 
+### Regression PDF report
+
+After running:
+
+```r
+res <- runRegression(mo.tr, X, Y, categorical)
+```
+
+the script generates a PDF report that quantitatively summarizes the performance of the regression models stored in `res`. The report is intended to provide a quick overview of which MOFA factors are most strongly associated with the selected outcome, as well as basic model-performance diagnostics.
+
+By default, the report is written to the same folder as the fitted MOFA model. The report filename includes both the outcome variable and the adjustment covariates. For example:
+
+```text
+mofa_factor_regression_report_Y=CR_covar=female+race.pdf
+```
+
+If no covariates are included in `X`, the filename uses `covar=none`:
+
+```text
+mofa_factor_regression_report_Y=CR_covar=none.pdf
+```
+
+The report includes explanatory text tailored to the type of regression that was run. For each MOFA factor, the report summarizes the coefficient for the factor term, its standard error, p-value, and confidence interval. The model-performance summary is sorted by the nominal factor-term p-value, with the smallest p-values listed first. If the number of factors exceeds the number that can fit on one page, the table automatically continues across additional pages.
+
+For logistic-regression analyses, the report includes classification-oriented summaries such as AUC, accuracy, McFadden pseudo-R², Brier score, AIC, and BIC, along with plots summarizing factor effect estimates, nominal p-values, and model performance metrics.
+
+For linear-regression analyses, the report includes continuous-outcome summaries such as R², adjusted R², RMSE, MAE, AIC, and BIC, along with plots summarizing factor effect estimates, nominal p-values, and model performance metrics.
+
+The report also includes diagnostic plots for the model with the smallest nominal p-value for the factor term. For linear models, these diagnostics focus on fitted values and residual behavior. For logistic models, they focus on predicted probabilities and observed outcome classes.
+
+If `ggplot2` is installed, the script uses it for report plots. Otherwise, the report is still generated using base R graphics.
+
 ## Recommended workflow
 
 1. Edit `resources.R` so all local file paths are correct.
@@ -328,3 +361,5 @@ sapply(res, function(model) exp(coef(model)))
 5. Edit `mofa_res_fname`, `X`, `Y`, and `categorical` in `regress_mofa_factors.R`.
 6. Run the regression script.
 7. Inspect the returned `res` object to review factor-outcome associations.
+8. Review the generated PDF report, whose filename includes the selected outcome and covariates, for example `mofa_factor_regression_report_Y=CR_covar=female+race.pdf`.
+
