@@ -83,11 +83,12 @@ makeFilenameLabel <- function(values, empty_label = "none") {
 }
 
 # Name of the PDF report file generated after the regression models are fit.
-# By default, this is written to the same folder as model.hdf5 and records both
-# the outcome variable and the covariate set in the filename, for example:
+# By default, this is written to the same folder as model.hdf5, under a 
+# subfolder named "regression_analysis", and records both the outcome variable 
+# and the covariate set in the filename, for example:
 #   mofa_factor_regression_report_Y=CR_covar=female+race.pdf
 regression_report_fname <- file.path(
-  dirname(mofa_res_fname),
+  dirname(mofa_res_fname), "regression_analysis",
   paste0(
     "mofa_factor_regression_report_Y=",
     makeFilenameLabel(Y, empty_label = "outcome"),
