@@ -2,10 +2,11 @@
 
 This folder contains R scripts for running a MOFA analysis on CALERIE omics data and then testing associations between the fitted MOFA factors and sample-level metadata variables.
 
-The workflow has two main stages:
+The workflow has two main stages, plus an optional factor-interpretation stage:
 
 1. **Fit a MOFA model** from one or more omics data matrices.
 2. **Regress a selected metadata outcome** on each fitted MOFA factor, optionally adjusting for metadata covariates.
+3. **Interpret the fitted MOFA factors** using view-specific enrichment analyses of the factor loadings.
 
 ## Files in this folder
 
@@ -14,6 +15,7 @@ The workflow has two main stages:
 | `resources.R` | Defines local file paths for the CALERIE input files. Edit this file to specify the file locations for your local compute environment. |
 | `MOFA_analysis_calerie.R` | Main MOFA-fitting script. It reads the omics and phenotype files, preprocesses the selected omics views, fits a MOFA model, and writes the fitted model to `model.hdf5`.  |
 | `regress_mofa_factors.R` | Loads a fitted `model.hdf5` file, runs one regression per MOFA factor, stores the fitted models in `res`, and generates a PDF report summarizing model performance and factor associations. The outcome, adjustment covariates, and categorical variables are user-selected near the top of the script. |
+| `mofa_factor_interpretation.R` | Loads a fitted MOFA object, extracts factor loadings for the available omics views, runs view-specific enrichment analyses, and generates a PDF report with factor-level biological interpretation summaries. For expression, proteomics, and methylation views, the script uses signed ranked `fgsea` analysis; for metabolomics, it uses Metabolon pathway/category overrepresentation analysis. |
 | `methods.R` | Helper functions sourced by `MOFA_analysis_calerie.R`, including data readers such as `readPhenoData()`, `readMethylation()`, `readProteomics()`, `readMetabolomics()`, and matrix helpers such as `fillEmptyCols()`.  |
 
 ## Required R packages
@@ -33,6 +35,8 @@ run_mofa(..., use_basilisk = TRUE)
 ```
 
 so MOFA2 will use `basilisk` to manage the Python environment automatically. The first run on a new machine can take longer because the Python/MOFA dependencies may need to be installed.
+
+The optional factor-interpretation script, `mofa_factor_interpretation.R`, uses additional Bioconductor and CRAN packages for annotation, ranked enrichment, and reporting, including `fgsea`, `AnnotationDbi`, `clusterProfiler`, `missMethyl`, `org.Hs.eg.db`, and optionally `future` / `future.apply` for parallel enrichment tasks.
 
 ## Input data
 
@@ -345,6 +349,50 @@ The report also includes diagnostic plots for the model with the smallest nomina
 
 If `ggplot2` is installed, the script uses it for report plots. Otherwise, the report is still generated using base R graphics.
 
+## Optional stage: interpret MOFA factors by enrichment analysis
+
+After fitting a MOFA model, use `mofa_factor_interpretation.R` to generate a biological interpretation report for the fitted factors. This script is intended to complement the regression workflow: instead of testing whether a factor is associated with a metadata outcome, it asks which biological pathways or feature categories are represented by the features with strong loadings on each factor.
+
+The script extracts per-factor feature loadings from the fitted MOFA object and analyzes the views present in the model. It expects the view names to be consistent with the MOFA-fitting workflow, such as `proteomics`, `methylation`, `metabolomics`, and `expression`.
+
+For expression, proteomics, and methylation views, the script uses a signed ranked enrichment strategy based on `fgsea`. For each factor and view, it builds one full ranked loading vector and runs enrichment once; the sign of the normalized enrichment score indicates whether a gene set is associated with the positive or negative side of the factor. Proteomics features are mapped from UniProt IDs to Entrez IDs, expression features are interpreted as Entrez IDs or gene symbols, and methylation CpG features are mapped to Entrez IDs using `missMethyl`.
+
+For metabolomics, the script uses the Metabolon annotation file to perform categorical overrepresentation analysis against fields such as `SUPER_PATHWAY`, `SUB_PATHWAY`, `PARENT_CLASSIFICATION`, and `CLASSIFICATION`. This branch remains set-based because the Metabolon pathway/category annotations are not gene sets and are interpreted separately from the ranked gene-based analyses.
+
+A typical call is:
+
+```r
+mofa_obj <- MOFA2::load_model(mofa_res_fname)
+metabolon_annot <- readr::read_tsv(calerie_metab_annot_fn, show_col_types = FALSE)
+
+res <- run_mofa_integrative_interpretation(
+  mofa_obj = mofa_obj,
+  metabolon_annotation = metabolon_annot,
+  output_dir = "mofa_factor_interpretation_report",
+  metabolomics_feature_col = "BIOCHEMICAL",
+  expression_id_type = "auto",
+  methylation_array_type = "EPIC",
+  report_significance_cutoff = 0.05,
+  render_report = TRUE,
+  include_top_features_in_report = FALSE,
+  report_engine = "base_pdf",
+  n_cores = 4,
+  fgsea_nproc = 1
+)
+```
+
+The default `base_pdf` report engine writes a PDF directly with base R graphics and does not require Pandoc or LaTeX. The optional `rmarkdown_pdf` engine can produce a more polished PDF, but it requires `rmarkdown`, Pandoc, and a LaTeX installation.
+
+The most important outputs are written to `output_dir` and include:
+
+| Output | Description |
+|---|---|
+| `mofa_integrative_factor_report.pdf` | PDF report summarizing factor-level enrichment results and biological interpretation text. |
+| `enrichment_results.csv` | Machine-readable table of enrichment results across factors and views. |
+| `top_factor_features.csv` | Top-loading features per factor and view. These are included in the PDF only when `include_top_features_in_report = TRUE`. |
+| `selected_factor_features.csv` | Features selected by the configured loading-selection rule, used primarily for set-based metabolomics enrichment. |
+| `all_mofa_loadings.csv` | Full table of extracted MOFA feature loadings. |
+
 ## Recommended workflow
 
 1. Edit `resources.R` so all local file paths are correct.
@@ -362,4 +410,5 @@ If `ggplot2` is installed, the script uses it for report plots. Otherwise, the r
 6. Run the regression script.
 7. Inspect the returned `res` object to review factor-outcome associations.
 8. Review the generated PDF report, whose filename includes the selected outcome and covariates, for example `mofa_factor_regression_report_Y=CR_covar=female+race.pdf`.
+9. Optionally run `mofa_factor_interpretation.R` on the same fitted MOFA model to generate a pathway- and feature-level interpretation report for the MOFA factors.
 
