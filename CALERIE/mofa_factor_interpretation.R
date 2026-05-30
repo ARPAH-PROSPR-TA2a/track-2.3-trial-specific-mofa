@@ -487,9 +487,7 @@ run_go_enrichment <- function(selected_entrez,
 	selected_entrez <- unique(na.omit(as.character(selected_entrez)))
 	background_entrez <- unique(na.omit(as.character(background_entrez)))
 	selected_entrez <- intersect(selected_entrez, background_entrez)
-	
-	if (length(selected_entrez) < 5 || length(background_entrez) < 20) return(tibble())
-	
+		
 	ego <- tryCatch({
 				clusterProfiler::enrichGO(
 						gene = selected_entrez,
@@ -539,9 +537,7 @@ run_reactome_enrichment <- function(selected_entrez,
 	selected_entrez <- unique(na.omit(as.character(selected_entrez)))
 	background_entrez <- unique(na.omit(as.character(background_entrez)))
 	selected_entrez <- intersect(selected_entrez, background_entrez)
-	
-	if (length(selected_entrez) < 5 || length(background_entrez) < 20) return(tibble())
-	
+		
 	er <- tryCatch({
 				ReactomePA::enrichPathway(
 						gene = selected_entrez,
@@ -742,7 +738,10 @@ run_fgsea_go_enrichment <- function(mapped_loadings,
 	
 	# Convert feature-level signed loadings to one ranked score per Entrez gene.
 	stats <- collapse_ranked_gene_scores(mapped_loadings)
-	if (length(stats) < 20) return(tibble())
+	# fgsea cannot test gene sets larger than the available ranked universe.
+	# If the ranked vector is smaller than the requested minimum gene-set size,
+	# no pathway can satisfy the size filter.
+	if (length(stats) < min_gene_set_size) return(tibble())
 	
 	# Build GO gene sets and restrict them to genes observed in this MOFA view.
 	pathways <- build_go_pathways_for_fgsea(OrgDb = OrgDb, ontology = ontology)
@@ -906,6 +905,125 @@ map_methylation_to_entrez_loadings <- function(cpg_loadings,
 			filter(!is.na(value), is.finite(value))
 }
 
+#' Prepare a CpG-to-Entrez mapping for methylation fgsea.
+#'
+#' This helper performs the missMethyl CpG-to-gene annotation step once, before
+#' task-level parallelization begins. The resulting plain tibble can then be
+#' safely passed to parallel workers, avoiding repeated calls to missMethyl
+#' annotation internals inside independent worker R sessions.
+#'
+#' @param all_cpgs Character vector containing the CpG universe for the
+#'   methylation view.
+#' @param array_type Illumina methylation array type understood by missMethyl,
+#'   for example `"EPIC"` or `"450K"` in this script.
+#'
+#' @return Tibble with columns `feature` and `ENTREZID`.
+prepare_methylation_entrez_mapping <- function(all_cpgs,
+		array_type = c("EPIC", "450K")) {
+	# Match the supported missMethyl array type in the main R process.
+	array_type <- match.arg(array_type)
+	
+	# missMethyl supplies the array-aware CpG-to-gene annotation machinery.
+	require_namespace("missMethyl", "precomputing methylation CpG-to-Entrez mapping")
+	
+	# Normalize the CpG universe and return a correctly shaped empty tibble if no
+	# methylation features are available.
+	all_cpgs <- unique(na.omit(as.character(all_cpgs)))
+	if (length(all_cpgs) == 0) {
+		return(tibble(feature = character(), ENTREZID = character()))
+	}
+	
+	# Call getMappedEntrezIDs() once in the main process. Passing all CpGs as both
+	# sig.cpg and all.cpg asks missMethyl to identify all mappable Entrez IDs in
+	# the methylation universe used by the MOFA model.
+	mapped_ids <- tryCatch({
+		missMethyl::getMappedEntrezIDs(
+				sig.cpg = all_cpgs,
+				all.cpg = all_cpgs,
+				array.type = array_type
+		)
+	}, error = function(e) NULL)
+	
+	if (is.null(mapped_ids)) {
+		return(tibble(feature = character(), ENTREZID = character()))
+	}
+	
+	# Retain the Entrez IDs that missMethyl regards as mappable for this CpG
+	# universe. Different missMethyl versions expose both sig.eg and all.eg, so use
+	# whichever are present.
+	valid_entrez <- unique(na.omit(as.character(unlist(mapped_ids[c("sig.eg", "all.eg")], use.names = FALSE))))
+	if (length(valid_entrez) == 0) {
+		return(tibble(feature = character(), ENTREZID = character()))
+	}
+	
+	# The flattened annotation provides the explicit CpG -> Entrez relationship
+	# needed to attach signed MOFA loadings to mapped genes.
+	flat <- tryCatch({
+		missMethyl:::.getFlatAnnotation(array_type)
+	}, error = function(e) NULL)
+	
+	if (is.null(flat) || nrow(flat) == 0) {
+		return(tibble(feature = character(), ENTREZID = character()))
+	}
+	
+	flat_tbl <- flat %>%
+			as.data.frame(stringsAsFactors = FALSE) %>%
+			as_tibble()
+	
+	# Defensively locate the CpG and Entrez columns. missMethyl currently returns
+	# lower-case names, but this keeps the helper robust to capitalization changes.
+	flat_names <- tolower(names(flat_tbl))
+	cpg_col <- names(flat_tbl)[match("cpg", flat_names)]
+	entrez_col <- names(flat_tbl)[match("entrezid", flat_names)]
+	
+	if (is.na(cpg_col) || is.na(entrez_col)) {
+		return(tibble(feature = character(), ENTREZID = character()))
+	}
+	
+	flat_tbl %>%
+			transmute(
+					feature = as.character(.data[[cpg_col]]),
+					ENTREZID = as.character(.data[[entrez_col]])
+			) %>%
+			filter(!is.na(feature), !is.na(ENTREZID)) %>%
+			filter(feature %in% all_cpgs, ENTREZID %in% valid_entrez) %>%
+			distinct(feature, ENTREZID)
+}
+
+#' Join methylation loadings to a precomputed CpG-to-Entrez mapping.
+#'
+#' This helper is used inside enrichment workers. It does not call missMethyl;
+#' it only joins one factor's CpG loadings to the mapping prepared by
+#' `prepare_methylation_entrez_mapping()` in the main process.
+#'
+#' @param cpg_loadings Tibble containing at least `feature` and `value` columns.
+#' @param methylation_entrez_mapping Tibble with columns `feature` and `ENTREZID`.
+#'
+#' @return Tibble with CpG features, Entrez IDs, and signed MOFA loading values.
+map_methylation_loadings_with_precomputed_mapping <- function(cpg_loadings,
+		methylation_entrez_mapping) {
+	# Return a correctly shaped empty tibble if no precomputed mapping is available.
+	if (is.null(methylation_entrez_mapping) || nrow(methylation_entrez_mapping) == 0) {
+		return(tibble(feature = character(), ENTREZID = character(), value = numeric()))
+	}
+	
+	# Keep only valid CpG features and signed loading values for the current factor.
+	cpg_loadings <- cpg_loadings %>%
+			select(feature, value) %>%
+			mutate(feature = as.character(feature), value = as.numeric(value)) %>%
+			filter(!is.na(feature), !is.na(value), is.finite(value))
+	
+	if (nrow(cpg_loadings) == 0) {
+		return(tibble(feature = character(), ENTREZID = character(), value = numeric()))
+	}
+	
+	# Join to the precomputed mapping rather than calling missMethyl inside a
+	# parallel worker.
+	methylation_entrez_mapping %>%
+			inner_join(cpg_loadings, by = "feature") %>%
+			filter(!is.na(ENTREZID), !is.na(value), is.finite(value))
+}
+
 # -----------------------------------------------------------------------------
 # Methylation enrichment via missMethyl
 # -----------------------------------------------------------------------------
@@ -922,6 +1040,8 @@ map_methylation_to_entrez_loadings <- function(cpg_loadings,
 #' @param sig_genes Logical flag passed to `missMethyl::gometh()`.
 #' @param prior_prob Logical flag indicating whether to model probe-number bias.
 #' @param p_adjust_method Multiple-testing correction method.
+#' @param min_selected Minimum required number of selected CpG IDs.
+#' @param min_background Minimum required number of all tested CpG IDs.
 #'
 #' @return Tibble of methylation enrichment results, or an empty tibble.
 run_methylation_enrichment <- function(selected_cpgs,
@@ -930,7 +1050,9 @@ run_methylation_enrichment <- function(selected_cpgs,
 		collection = c("GO", "KEGG"),
 		sig_genes = FALSE,
 		prior_prob = TRUE,
-		p_adjust_method = "BH") {
+		p_adjust_method = "BH",
+		min_selected = 5,
+		min_background = 50) {
 	# Use a CpG-aware method to reduce bias from unequal probe coverage across genes.
 	array_type <- match.arg(array_type)
 	collection <- match.arg(collection)
@@ -941,7 +1063,8 @@ run_methylation_enrichment <- function(selected_cpgs,
 	background_cpgs <- unique(na.omit(as.character(background_cpgs)))
 	selected_cpgs <- intersect(selected_cpgs, background_cpgs)
 	
-	if (length(selected_cpgs) < 5 || length(background_cpgs) < 50) return(tibble())
+	if (length(selected_cpgs) < min_selected || length(background_cpgs) < min_background) 
+		return(tibble())
 	
 	gm <- tryCatch({
 				missMethyl::gometh(
@@ -1004,6 +1127,8 @@ clean_metabolon_annotation <- function(metabolon_annotation) {
 #' @param term_cols Annotation columns to test as categorical terms.
 #' @param min_term_size Minimum background count required for a term to be tested.
 #' @param p_adjust_method Multiple-testing correction method.
+#' @param min_selected Minimum required number of selected metabolite features.
+#' @param min_background Minimum required number of all metabolite features in the MOFA view.
 #'
 #' @return Tibble of categorical enrichment results.
 run_categorical_enrichment <- function(selected_features,
@@ -1012,13 +1137,18 @@ run_categorical_enrichment <- function(selected_features,
 		feature_col,
 		term_cols = c("SUPER_PATHWAY", "SUB_PATHWAY", "PARENT_CLASSIFICATION", "CLASSIFICATION"),
 		min_term_size = 3,
-		p_adjust_method = "BH") {
+		p_adjust_method = "BH",
+		min_selected = 3,
+		min_background = 10) {
 	# Treat each Metabolon pathway/class label as a categorical feature set.
 	selected_features <- unique(na.omit(as.character(selected_features)))
 	background_features <- unique(na.omit(as.character(background_features)))
 	selected_features <- intersect(selected_features, background_features)
 	
-	if (length(selected_features) < 3 || length(background_features) < 10) return(tibble())
+	if (length(selected_features) < min_selected || 
+			length(background_features) < min_background) 
+		return(tibble())
+	
 	if (!feature_col %in% names(annotation)) {
 		stop("Metabolon feature_col '", feature_col, "' not found in annotation.", call. = FALSE)
 	}
@@ -1151,6 +1281,9 @@ make_top_feature_table <- function(loadings,
 #' @param methylation_array_type Illumina methylation array type.
 #' @param methylation_collection Retained for compatibility with older ORA-based methylation
 #'   enrichment code; ranked methylation enrichment uses `go_ontology`.
+#' @param methylation_entrez_mapping Optional precomputed CpG-to-Entrez mapping.
+#'   If `NULL`, the mapping is prepared once in the main process before
+#'   task-level parallelization begins.
 #' @param qvalue_cutoff Adjusted p-value cutoff for reported enrichment results.
 #' @param metabolon_term_cols Metabolon columns used as categorical terms.
 #' @param n_cores Number of task-level parallel workers. Each task is one
@@ -1170,6 +1303,7 @@ run_all_enrichments <- function(loadings,
 		go_ontology = "BP",
 		methylation_array_type = c("EPIC", "450K"),
 		methylation_collection = "GO",
+		methylation_entrez_mapping = NULL,
 		qvalue_cutoff = 0.25,
 		metabolon_term_cols = c("SUPER_PATHWAY", "SUB_PATHWAY", "PARENT_CLASSIFICATION", "CLASSIFICATION"),
 		n_cores = 1L,
@@ -1181,6 +1315,27 @@ run_all_enrichments <- function(loadings,
 	# Normalize parallelization parameters before dispatching tasks.
 	n_cores <- normalize_n_cores(n_cores)
 	fgsea_nproc <- normalize_n_cores(fgsea_nproc)
+	
+	# Prepare methylation CpG-to-Entrez mapping before task-level parallelization.
+	# This avoids calling missMethyl annotation helpers from independent worker R
+	# sessions, which can behave inconsistently across parallel workers.
+	if (is.null(methylation_entrez_mapping) && any(loadings$view == "methylation")) {
+		methylation_entrez_mapping <- prepare_methylation_entrez_mapping(
+				all_cpgs = loadings %>% filter(view == "methylation") %>% pull(feature),
+				array_type = methylation_array_type
+		)
+	}
+	
+	# Ensure that workers always receive a plain tibble with the expected columns.
+	if (is.null(methylation_entrez_mapping)) {
+		methylation_entrez_mapping <- tibble(feature = character(), ENTREZID = character())
+	} else {
+		methylation_entrez_mapping <- methylation_entrez_mapping %>%
+				as_tibble() %>%
+				transmute(feature = as.character(feature), ENTREZID = as.character(ENTREZID)) %>%
+				filter(!is.na(feature), !is.na(ENTREZID)) %>%
+				distinct(feature, ENTREZID)
+	}
 	
 	# Ranked gene/protein/methylation analyses use the full signed loading vector
 	# exactly once per factor and view. fgsea then assigns positive or negative
@@ -1241,12 +1396,11 @@ run_all_enrichments <- function(loadings,
 										fgsea_nproc = fgsea_nproc
 								)
 							} else if (view_i == "methylation") {
-								# Map all CpG loadings for this factor to Entrez IDs, then run fgsea.
-								# This uses the signed methylation loading vector instead of a top-CpG ORA cutoff.
-								mapped_loadings <- map_methylation_to_entrez_loadings(
+								# Join this factor's CpG loadings to the CpG-to-Entrez mapping that
+								# was prepared once before parallel workers were launched.
+								mapped_loadings <- map_methylation_loadings_with_precomputed_mapping(
 										cpg_loadings = background_i,
-										all_cpgs = background_i$feature,
-										array_type = methylation_array_type
+										methylation_entrez_mapping = methylation_entrez_mapping
 								)
 								
 								run_gene_fgsea_bundle(
@@ -1907,13 +2061,19 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 #' @param include_top_features_in_report Logical. If `TRUE`, include factor-specific
 #'   top loaded feature tables in the PDF report. Defaults to `FALSE` to keep
 #'   the report focused on enrichment summaries.
+#' @param save_loadings Logical. If `TRUE`, save information about features and 
+#'   feature loadings in a number of CSV files. 
 #' @param report_engine Character string specifying the report engine. Use
 #'   `"base_pdf"` to generate a PDF directly with base R graphics without
 #'   Pandoc or LaTeX. Use `"rmarkdown_pdf"` for a more polished PDF that
 #'   requires rmarkdown, Pandoc, and LaTeX.
 #' @param n_cores Number of task-level parallel workers for enrichment analyses.
-#'   Use `1` for serial execution. On Windows, parallel task execution requires
-#'   the optional `future` and `future.apply` packages.
+#'   The number of enrichment analyses that will performed equal (1) the number
+#'   of factors specified in argument `factors`times (2) the number of data 
+#'   views in the MOFA results object passed as the value of `mofa_obj`. Each
+#'   of the `n_cores` specified will be dispatched to handle a single enrichment
+#'   analysis. Use `n_cores = 1` for serial execution. On Windows, parallel task 
+#'   execution requires the optional `future` and `future.apply` packages.
 #' @param fgsea_nproc Number of CPUs passed to `fgsea::fgsea()` inside each
 #'   expression, proteomics, or methylation enrichment task. Keep this at `1`
 #'   when `n_cores > 1` to avoid oversubscribing CPUs. 
@@ -1963,6 +2123,7 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 		metabolon_term_cols = c("SUPER_PATHWAY", "SUB_PATHWAY", "PARENT_CLASSIFICATION", "CLASSIFICATION"),
 		render_report = TRUE,
 		include_top_features_in_report = FALSE,
+		save_loadings = FALSE,
 		report_engine = c("base_pdf", "rmarkdown_pdf"),
 		n_cores = 1L,
 		fgsea_nproc = 1L) {
@@ -2066,10 +2227,12 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 	
 	dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 	saveRDS(results, file.path(output_dir, "mofa_integrative_results.rds"))
-	write_csv(loadings, file.path(output_dir, "all_mofa_loadings.csv"))
-	write_csv(selected_features, file.path(output_dir, "selected_factor_features.csv"))
-	write_csv(top_features, file.path(output_dir, "top_factor_features.csv"))
 	write_csv(enrichment_results, file.path(output_dir, "enrichment_results.csv"))
+	if(save_loadings){
+		write_csv(loadings, file.path(output_dir, "all_mofa_loadings.csv"))
+		write_csv(selected_features, file.path(output_dir, "selected_factor_features.csv"))
+		write_csv(top_features, file.path(output_dir, "top_factor_features.csv"))
+	}
 	
 	if (render_report) {
 		# Render the final factor-by-factor PDF report using the selected engine.
@@ -2127,7 +2290,7 @@ res <- run_mofa_integrative_interpretation(
 		metabolon_annotation = metabolon_annot,
 		output_dir = file.path(mofa_dir, "mofa_factor_interpretation"),
 		views = views_names(mofa_obj),
-		factors = c(1,22),
+		factors = "all",
 		selection_mode = "top_n",
 		top_n = 100,
 		min_features = 5,
@@ -2135,7 +2298,7 @@ res <- run_mofa_integrative_interpretation(
 		expression_id_type = "auto",
 		OrgDb = "org.Hs.eg.db",
 		organism = "human",
-		go_ontology = "BP",
+		go_ontology = "MF",
 		methylation_array_type = "EPIC",
 		methylation_collection = "GO",
 		qvalue_cutoff = 0.1,
@@ -2143,11 +2306,14 @@ res <- run_mofa_integrative_interpretation(
 		render_report = TRUE,
 		report_engine = "base_pdf",
 		n_cores = 4, # Change according to your execution environment
-		fgsea_nproc = 1 # Change according to your execution environment
+		fgsea_nproc = 1 # Best to leave this at 1
 )
 
 # Important output files:
 #   mofa_factor_interpretation_report/mofa_integrative_factor_report.pdf
 #   mofa_factor_interpretation_report/enrichment_results.csv
+#   
+# To generate the files below, set the argument `save_loading` to TRUE when 
+# calling run_mofa_integrative_interpretation().
 #   mofa_factor_interpretation_report/top_factor_features.csv
 #   mofa_factor_interpretation_report/selected_factor_features.csv
