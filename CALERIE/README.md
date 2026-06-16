@@ -5,7 +5,7 @@ This folder contains R scripts for running a MOFA analysis on CALERIE omics data
 The workflow has two main stages, plus an optional factor-interpretation stage:
 
 1. **Fit a MOFA model** from one or more omics data matrices.
-2. **Regress a selected metadata outcome** on each fitted MOFA factor, optionally adjusting for metadata covariates.
+2. **Regress a selected metadata outcome** on each fitted MOFA factor, optionally adjusting for metadata covariates, or optionally regress each MOFA factor on a selected metadata variable.
 3. **Interpret the fitted MOFA factors** using view-specific enrichment analyses of the factor loadings.
 
 ## Files in this folder
@@ -14,7 +14,7 @@ The workflow has two main stages, plus an optional factor-interpretation stage:
 |---|---|
 | `resources.R` | Defines local file paths for the CALERIE input files. Edit this file to specify the file locations for your local compute environment. |
 | `MOFA_analysis_calerie.R` | Main MOFA-fitting script. It reads the omics and phenotype files, preprocesses the selected omics views, fits a MOFA model, and writes the fitted model to `model.hdf5`.  |
-| `regress_mofa_factors.R` | Loads a fitted `model.hdf5` file, runs one regression per MOFA factor, stores the fitted models in `res`, and generates a PDF report summarizing model performance and factor associations. The outcome, adjustment covariates, and categorical variables are user-selected near the top of the script. |
+| `regress_mofa_factors.R` | Loads a fitted `model.hdf5` file, runs one regression per MOFA factor, stores the fitted models in `res`, and generates a PDF report summarizing model performance and factor associations. The outcome/explanatory metadata variable, adjustment covariates, regression direction, and categorical variables are user-selected near the top of the script. |
 | `mofa_factor_interpretation.R` | Loads a fitted MOFA object, extracts factor loadings for the available omics views, runs view-specific enrichment analyses, and generates a PDF report with factor-level biological interpretation summaries. For expression, proteomics, and methylation views, the script uses signed ranked `fgsea` analysis; for metabolomics, it uses Metabolon pathway/category overrepresentation analysis. |
 | `methods.R` | Helper functions sourced by `MOFA_analysis_calerie.R`, including data readers such as `readPhenoData()`, `readMethylation()`, `readProteomics()`, `readMetabolomics()`, and matrix helpers such as `fillEmptyCols()`.  |
 
@@ -226,7 +226,7 @@ The fitted model stored in `model.hdf5` contains the fitted data views, feature 
 
 ## Stage 2: regress metadata outcomes on MOFA factors
 
-After fitting a model, use `regress_mofa_factors.R` to test whether a selected metadata outcome is associated with each MOFA factor.
+After fitting a model, use `regress_mofa_factors.R` to test whether a selected metadata variable is associated with each MOFA factor. Setting `factors_as_Y <- FALSE` treats the selected metadata variable `Y` as the dependent variable and each factor as the explanatory variable. Alternatively, setting `factors_as_Y <- TRUE` treats each MOFA factor as the dependent variable and tests `Y` as the explanatory variable of interest. In both cases, additional covariates can be specified in the variable `X`.
 
 Open `regress_mofa_factors.R` and edit the user-specified inputs near the top of the file.
 
@@ -235,6 +235,7 @@ mofa_res_fname <- "D:/R_sessions/PROSPR/MOFA/.../model.hdf5"
 
 X <- c("bmistrat")
 Y <- "CR"
+factors_as_Y <- FALSE
 
 categorical <- c(
   "DEID", "CR", "deidsite", "strata", "female", "ethnic", "race",
@@ -248,9 +249,10 @@ categorical <- c(
 |---|---|
 | `mofa_res_fname` | Full path to the fitted MOFA model, i.e., the `model.hdf5` file created by `MOFA_analysis_calerie.R`. |
 | `X` | Character vector of metadata covariates to include in every model. Use `character(0)` for no covariates. |
-| `Y` | Name of the metadata column to use as the dependent variable. This will typically be `"CR"`|
-| `categorical` | Metadata columns that should be treated as categorical variables. Include `Y` here when the outcome should be modeled using logistic regression. |
-| `regression_report_fname` | Output path for the PDF regression report. By default, this is written next to `model.hdf5`, and the filename includes the outcome `Y` and the covariates in `X`. |
+| `Y` | Name of the metadata column to use as the dependent variable when `factors_as_Y == FALSE`, or as the explanatory variable of interest when `factors_as_Y == TRUE`. |
+| `factors_as_Y` | Boolean variable controlling the regression direction. If `FALSE`, the script fits `Y ~ Factor_i + X_covariates`. If `TRUE`, the script fits `Factor_i ~ Y + X_covariates`. |
+| `categorical` | Metadata columns that should be treated as categorical variables. Include `Y` here when `factors_as_Y == FALSE` and the outcome should be modeled using logistic regression. Also include `Y` or any covariates here when they should be treated as categorical explanatory variables in `factors_as_Y == TRUE` mode. |
+| `regression_report_fname` | Output path for the PDF regression report. By default, this is written in a sub-folder within the directory where `model.hdf5` is located, and the filename includes the outcome/explanatory variable `Y` and the covariates in `X`. |
 
 ### Model fitted by the regression script
 
@@ -266,7 +268,15 @@ Then it runs:
 res <- runRegression(mo.tr, X, Y, categorical)
 ```
 
-For each MOFA factor, the script fits one model of the form:
+The regression direction is controlled by `factors_as_Y`.
+
+When:
+
+```r
+factors_as_Y <- FALSE
+```
+
+the script fits one model per MOFA factor of the form:
 
 ```r
 Y ~ Factor_i + X_covariates
@@ -278,18 +288,40 @@ Internally, the current factor is stored in a temporary column named `F`, so the
 Y ~ F + covariates
 ```
 
+When:
+
+```r
+factors_as_Y <- TRUE
+```
+
+the script instead fits one linear model per MOFA factor of the form:
+
+```r
+Factor_i ~ Y + X_covariates
+```
+
+Internally, the current factor is again stored in a temporary column named `F`, so the formula is constructed as:
+
+```r
+F ~ Y + covariates
+```
+
+In this mode, the report focuses on the coefficient or term-level p-value for `Y`, because `Y` is the explanatory variable being tested against each factor.
+
 ### Logistic versus linear regression
 
-`runRegression()` chooses the model type from the outcome variable `Y`:
+When `factors_as_Y == FALSE`, `runRegression()` chooses the model type from the outcome variable `Y`:
 
 | Outcome type | Model used |
 |---|---|
 | `Y` listed in `categorical`, or otherwise stored as a factor/character/logical variable | Logistic regression using `glm(..., family = binomial())` |
 | Numeric `Y` not listed in `categorical` | Linear regression using `lm()` |
 
-Important: a numeric `0/1` outcome is treated as continuous unless its column name is included in `categorical`. 
+Important: in this  mode, a numeric `0/1` outcome is treated as continuous unless its column name is included in `categorical`. 
 
 For logistic regression, the outcome must have exactly two observed classes after missing values are removed for a given factor model. The first factor level is used as the reference level by R. Use `relevel()` in the metadata before modeling if you need a specific reference category.
+
+When `factors_as_Y == TRUE`, each MOFA factor is the dependent variable, so the script always fits a linear regression model. In this mode, `Y` is an explanatory variable. If `Y` is categorical, include it in `categorical` so it is represented using R's standard factor contrasts. For categorical explanatory variables with more than two levels, the report uses an omnibus term-level p-value for `Y`, rather than a single dummy-coefficient p-value.
 
 ### Regression output
 
@@ -300,7 +332,7 @@ res[["Factor 1"]]
 res[["Factor 2"]]
 ```
 
-Each entry is either a `glm` object for logistic regression or an `lm` object for linear regression.
+When `factors_as_Y == FALSE`, each entry is either a `glm` object for logistic regression or an `lm` object for linear regression. When `factors_as_Y == TRUE`, each entry is an `lm` object because the MOFA factor is the continuous dependent variable.
 
 Useful inspection commands:
 
@@ -311,7 +343,7 @@ summary(res[["Factor 1"]])
 lapply(res, summary)
 ```
 
-For logistic regression, coefficients are on the log-odds scale. Exponentiate coefficients to obtain odds ratios:
+For logistic regression in the default `factors_as_Y == FALSE` mode, coefficients are on the log-odds scale. Exponentiate coefficients to obtain odds ratios:
 
 ```r
 sapply(res, function(model) exp(coef(model)))
@@ -325,9 +357,9 @@ After running:
 res <- runRegression(mo.tr, X, Y, categorical)
 ```
 
-the script generates a PDF report that quantitatively summarizes the performance of the regression models stored in `res`. The report is intended to provide a quick overview of which MOFA factors are most strongly associated with the selected outcome, as well as basic model-performance diagnostics.
+the script generates a PDF report that quantitatively summarizes the performance of the regression models stored in `res`. The report is intended to provide a quick overview of which MOFA factors are most strongly associated with the selected outcome or explanatory variable, as well as basic model-performance diagnostics.
 
-By default, the report is written to the same folder as the fitted MOFA model. The report filename includes both the outcome variable and the adjustment covariates. For example:
+By default, the report is written to a sub-directory within the same folder as the fitted MOFA model. The report filename includes both the outcome/explanatory variable and the adjustment covariates. For example:
 
 ```text
 mofa_factor_regression_report_Y=CR_covar=female+race.pdf
@@ -339,13 +371,13 @@ If no covariates are included in `X`, the filename uses `covar=none`:
 mofa_factor_regression_report_Y=CR_covar=none.pdf
 ```
 
-The report includes explanatory text tailored to the type of regression that was run. For each MOFA factor, the report summarizes the coefficient for the factor term, its standard error, p-value, and confidence interval. The model-performance summary is sorted by the nominal factor-term p-value, with the smallest p-values listed first. If the number of factors exceeds the number that can fit on one page, the table automatically continues across additional pages.
+The report includes explanatory text tailored to the type and direction of regression that was run. When `factors_as_Y == FALSE`, the report summarizes the coefficient for the factor term, its standard error, p-value, and confidence interval. When `factors_as_Y == TRUE`, the report instead summarizes the coefficient or omnibus term-level p-value for `Y`, because `Y` is the explanatory variable of interest. The model-performance summary is sorted by the nominal p-value for the tested term, with the smallest p-values listed first. If the number of factors exceeds the number that can fit on one page, the table automatically continues across additional pages.
 
-For logistic-regression analyses, the report includes classification-oriented summaries such as AUC, accuracy, McFadden pseudo-R², Brier score, AIC, and BIC, along with plots summarizing factor effect estimates, nominal p-values, and model performance metrics.
+For logistic-regression analyses, the report includes classification-oriented summaries such as AUC, accuracy, McFadden pseudo-R², Brier score, AIC, and BIC, along with plots summarizing factor effect estimates, nominal p-values, and model performance metrics. Logistic regression is used only in the default `factors_as_Y == FALSE` mode when `Y` is categorical or binary.
 
-For linear-regression analyses, the report includes continuous-outcome summaries such as R², adjusted R², RMSE, MAE, AIC, and BIC, along with plots summarizing factor effect estimates, nominal p-values, and model performance metrics.
+For linear-regression analyses, the report includes continuous-outcome summaries such as R², adjusted R², RMSE, MAE, AIC, and BIC, along with plots summarizing the tested effect estimates, nominal p-values, and model performance metrics. Linear regression is used for continuous outcomes in the default mode and for all models when `factors_as_Y == TRUE`.
 
-The report also includes diagnostic plots for the model with the smallest nominal p-value for the factor term. For linear models, these diagnostics focus on fitted values and residual behavior. For logistic models, they focus on predicted probabilities and observed outcome classes.
+The report also includes diagnostic plots for the model with the smallest nominal p-value for the tested term. For linear models, these diagnostics focus on fitted values and residual behavior. For logistic models, they focus on predicted probabilities and observed outcome classes.
 
 If `ggplot2` is installed, the script uses it for report plots. Otherwise, the report is still generated using base R graphics.
 
@@ -406,9 +438,8 @@ The most important outputs are written to `output_dir` and include:
    - `covariates`, if residualization is enabled
 3. Run the MOFA analysis.
 4. Locate the resulting `model.hdf5` file in the timestamped output folder.
-5. Edit `mofa_res_fname`, `X`, `Y`, and `categorical` in `regress_mofa_factors.R`.
+5. Edit `mofa_res_fname`, `X`, `Y`, `factors_as_Y`, and `categorical` in `regress_mofa_factors.R`.
 6. Run the regression script.
-7. Inspect the returned `res` object to review factor-outcome associations.
-8. Review the generated PDF report, whose filename includes the selected outcome and covariates, for example `mofa_factor_regression_report_Y=CR_covar=female+race.pdf`.
+7. Inspect the returned `res` object to review factor-outcome or outcome-factor associations.
+8. Review the generated PDF report, whose filename includes the selected outcome/explanatory variable and covariates, for example `mofa_factor_regression_report_Y=CR_covar=female+race.pdf`.
 9. Optionally run `mofa_factor_interpretation.R` on the same fitted MOFA model to generate a pathway- and feature-level interpretation report for the MOFA factors.
-
