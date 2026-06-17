@@ -475,3 +475,4 @@ The most important outputs are written to `output_dir` and include:
 8. Inspect the returned `res` object to review factor-outcome or outcome-factor associations.
 9. Review the generated PDF report, whose filename includes the selected outcome/explanatory variable and covariates, for example `mofa_factor_regression_report_Y=CR_covar=female+race.pdf`.
 10. Optionally run `mofa_factor_interpretation.R` on the same fitted MOFA model to generate a pathway- and feature-level interpretation report for the MOFA factors.
+
