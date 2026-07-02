@@ -2,7 +2,7 @@
 
 This repository contains code for running and exploring **Multi-Omics Factor Analysis (MOFA)** models across multiple studies.
 
-The repository is organized with **one folder per study**. Each study folder contains a customized MOFA workflow tailored to that study's input data, metadata, modeling choices, and downstream analyses.
+The repository is organized with **one folder per study**. Each study folder contains a customized MOFA workflow tailored to that study's input data, metadata, modeling choices, and downstream analyses. There is also a folder called `common`, which contains the code that is not specific for each study, e.g. the utility code used in various contexts.
 
 ## Repository organization
 
@@ -21,6 +21,10 @@ A typical repository layout is:
 │   ├── resources.R
 │   ├── MOFA_analysis.R
 │   ├── regress_mofa_factors.R
+│   └── ...
+├── common/
+│   ├── README.md
+│   ├── Utils.R
 │   └── ...
 └── README.md
 ```
