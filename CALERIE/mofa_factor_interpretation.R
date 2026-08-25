@@ -2226,8 +2226,10 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 	)
 	
 	dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-	saveRDS(results, file.path(output_dir, "mofa_integrative_results.rds"))
-	write_csv(enrichment_results, file.path(output_dir, "enrichment_results.csv"))
+	saveRDS(results, file.path(output_dir, 
+					paste0("mofa_integrative_results_", go_ontology, ".rds")))
+	write_csv(enrichment_results, file.path(output_dir, 
+					paste0("enrichment_results_", go_ontology, ".csv")))
 	if(save_loadings){
 		write_csv(loadings, file.path(output_dir, "all_mofa_loadings.csv"))
 		write_csv(selected_features, file.path(output_dir, "selected_factor_features.csv"))
@@ -2242,6 +2244,7 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			report_path <- render_mofa_pdf_report_base(
 					results = results,
 					output_dir = output_dir,
+					output_file = paste0("mofa_integrative_factor_report_", go_ontology, ".pdf"),
 					report_significance_cutoff = report_significance_cutoff,
 					include_top_features = include_top_features_in_report
 			)
@@ -2251,6 +2254,7 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			report_path <- render_mofa_report_rmarkdown_pdf(
 					results = results,
 					output_dir = output_dir,
+					output_file = paste0("mofa_integrative_factor_report_", go_ontology, ".pdf"),
 					report_significance_cutoff = report_significance_cutoff,
 					include_top_features = include_top_features_in_report
 			)
@@ -2276,7 +2280,9 @@ library(rmarkdown)
 
 # Specify file locations - edit according to your local execution environment
 mofa_dir <- file.path("D:/R_sessions/PROSPR/MOFA",
-		"2026_May_15_00_40_17_visit=24mo_change_scores_ungrouped_views=me+pr+mb")
+		"2026_Jun_28_00_49_09_visit=24mo_change_scores_ungrouped_views=me")
+#mofa_dir <- file.path("D:/R_sessions/PROSPR/MOFA",
+#		"2026_May_15_00_40_17_visit=24mo_change_scores_ungrouped_views=me+pr+mb")
 mofa_res_fn <- file.path(mofa_dir, "model.hdf5")
 metab_ann_fn <- file.path("E:/Data/PROSPR-FAST/CALERIE/metabolomics",
 		"metabolon_annotations.csv")
@@ -2298,14 +2304,14 @@ res <- run_mofa_integrative_interpretation(
 		expression_id_type = "auto",
 		OrgDb = "org.Hs.eg.db",
 		organism = "human",
-		go_ontology = "MF",
+		go_ontology = "BP",
 		methylation_array_type = "EPIC",
 		methylation_collection = "GO",
 		qvalue_cutoff = 0.1,
 		report_significance_cutoff = 0.05,
 		render_report = TRUE,
 		report_engine = "base_pdf",
-		n_cores = 4, # Change according to your execution environment
+		n_cores = 1, # Change according to your execution environment
 		fgsea_nproc = 1 # Best to leave this at 1
 )
 

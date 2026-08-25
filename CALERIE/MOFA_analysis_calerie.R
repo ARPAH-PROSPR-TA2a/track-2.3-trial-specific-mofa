@@ -46,7 +46,8 @@ code_dir <- "D:/git/Belsky/track-2.3-trial-specific-mofa/CALERIE"
 
 # Location of directory where to store results and output - modify as desired
 # for your local run environment
-output_dir <- "D:/R_sessions/PROSPR/MOFA"
+# output_dir <- "D:/R_sessions/PROSPR/MOFA"
+output_dir <- "D:/R_sessions/PROSPR/MOFA/reliable_probes"
 
 # Specify the target visit timepoint, either 12 or 24
 timepoint <- 24
@@ -57,7 +58,16 @@ use_change_scores <- TRUE
 
 # If TRUE, run MOFA with AL and CR as separate groups. If FALSE, do not pass
 # groups to MOFA, so all samples are analyzed together.
-use_groups <- TRUE
+use_groups <- FALSE
+
+# Set scaling factor controlling how many features to retain per view
+# (relative to the smallest view) 
+max_factor <- 5
+
+# Set an absolute upper bound on the number of features per view - useful
+# primarily when running MOFA with only the methylation data view, to
+# avoid performance degradation due to hundreds of thousands of features
+max_features <- 10000
 
 # If TRUE, each omics matrix is residualized immediately after it is read from
 # file and before any downstream processing, such as change-score calculation,
@@ -762,13 +772,6 @@ filterMostVariableFeatures <- function(data_views, max_factor=5, groups = NULL,
 			}, data_views, names(data_views), SIMPLIFY = FALSE)
 }
 
-# Set scaling factor controlling how many features to retain per view
-# (relative to the smallest view) 
-max_factor <- 5
-# Set an absolute upper bound on the number of features per view - useful
-# primarily when running MOFA with only the methylation data view, to
-# avoid performance degradation due to hundreds of thousands of features
-max_features <- 10000
 # Collect the union of all sample IDs across views (column names),
 # ensuring that group assignment covers all samples present
 sample_ids_for_filter <- Reduce(union, lapply(data_views, colnames))
@@ -833,7 +836,7 @@ data_opts$use_float32 <- FALSE
 
 # Set model options.
 model_opts <- get_default_model_options(mdd)
-model_opts$num_factors <- 50 # If we want to manually set the factor num
+model_opts$num_factors <- 45 # If we want to manually set the factor num
 
 # Set training options.
 train_opts <- get_default_training_options(mdd)
