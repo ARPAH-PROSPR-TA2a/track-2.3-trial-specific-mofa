@@ -168,10 +168,13 @@ readMetabolomics <- function(fname, ann_fname = NULL){
 	meta <- dd[, seq_len(meta_cols), drop = FALSE]
 	data <- dd[, -(seq_len(meta_cols)), drop = FALSE]
 	rownames(data) <- meta$CLIENT_IDENTIFIER
-	# Metabolon measurements are expected to be median centered. Log2
+	# Metabolon measurements are expected to be median-scaled. Log2
 	# transform them to prepare the matrix for MOFA analysis.
-	epsilon = min(data[data != 0])/2
-	data = log2(data)
+	if (any(data == 0, na.rm = TRUE)) {
+		epsilon <- min(data[data > 0], na.rm = TRUE) / 2
+		data <- data + epsilon
+	}
+	data <- log2(data)
 	# Transpose so rows are metabolite features and columns are sample
 	# barcodes, matching the omics_input_defs$reader contract.
 	res <- list(data = t(data), meta = meta)

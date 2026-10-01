@@ -22,6 +22,10 @@
 #   8. Returns fitted model objects in a nested list called res.
 #   9. Generates a separate PDF report for each model direction and Y/X
 #      combination.
+#  10. Generates one consolidated Excel workbook containing model-level results,
+#      coefficient-level results, and a data dictionary for all fitted models.
+#  11. Writes the same three summary tables to an RDS file, as a named list with
+#      one data matrix per Excel worksheet.
 #
 # Edit regression_parameters.R, then execute this script in one of two ways:
 #
@@ -1069,6 +1073,249 @@ runRegression <- function(mo.tr = NULL, sample_metadata = NULL,
 }
 
 # -----------------------------------------------------------------------------
+# Excel summary helper functions
+# -----------------------------------------------------------------------------
+
+# Replace the temporary model variable F in a fitted formula with the displayed
+# MOFA factor name. The resulting formula is used as the human-readable model ID.
+makeModelId <- function(model, factor_name) {
+	fmla <- stats::formula(model)
+	parts <- as.character(fmla)
+	if (length(parts) != 3L) {
+		return(paste(deparse(fmla), collapse = " "))
+	}
+	lhs <- parts[2L]
+	rhs <- parts[3L]
+	factor_term <- quoteFormulaName(factor_name)
+	lhs <- gsub("(?<![[:alnum:]_.`])F(?![[:alnum:]_.`])", factor_term, lhs,
+			perl = TRUE)
+	rhs <- gsub("(?<![[:alnum:]_.`])F(?![[:alnum:]_.`])", factor_term, rhs,
+			perl = TRUE)
+	paste(lhs, "~", rhs)
+}
+
+# Return a model-wide p-value against the intercept-only model. For linear models
+# this is the usual F-test p-value; for logistic models it is a likelihood-ratio
+# chi-square test based on the null and residual deviances.
+extractOverallModelPValue <- function(model) {
+	model_type <- getModelType(model)
+	if (model_type == "linear") {
+		fs <- summary(model)$fstatistic
+		if (is.null(fs) || anyNA(fs)) return(NA_real_)
+		return(stats::pf(fs[[1L]], fs[[2L]], fs[[3L]], lower.tail = FALSE))
+	}
+	if (model_type == "logistic") {
+		df <- model$df.null - model$df.residual
+		if (!is.finite(df) || df <= 0L) return(NA_real_)
+		return(stats::pchisq(model$null.deviance - model$deviance,
+				df = df, lower.tail = FALSE))
+	}
+	NA_real_
+}
+
+# Build the one-row-per-model table used by the Models worksheet.
+buildExcelModelRows <- function(res, outcome, covariates, factors_as_Y) {
+	summary_d <- summarizeRegressionModels(res)
+	association_term <- attr(res, "association_term")
+	rows <- lapply(seq_along(res), function(i) {
+		model <- res[[i]]
+		factor_name <- names(res)[i]
+		model_type <- getModelType(model)
+		model_id <- makeModelId(model, factor_name)
+		mf <- stats::model.frame(model)
+		response <- if (isTRUE(factors_as_Y)) factor_name else names(mf)[1L]
+		observed <- stats::model.response(mf)
+		log_lik <- tryCatch(as.numeric(stats::logLik(model)), error = function(e) NA_real_)
+		residual_se <- if (model_type == "linear") unname(summary(model)$sigma) else NA_real_
+		events <- non_events <- NA_integer_
+		if (model_type == "logistic") {
+			y01 <- as.integer(observed) - 1L
+			events <- sum(y01 == 1L, na.rm = TRUE)
+			non_events <- sum(y01 == 0L, na.rm = TRUE)
+		}
+		assoc <- extractAssociationCoefficient(model, association_term)
+		or <- or_lo <- or_hi <- NA_real_
+		if (model_type == "logistic" && is.finite(assoc["estimate"]) &&
+				is.finite(assoc["se"])) {
+			or <- exp(assoc["estimate"])
+			or_lo <- exp(assoc["estimate"] - stats::qnorm(0.975) * assoc["se"])
+			or_hi <- exp(assoc["estimate"] + stats::qnorm(0.975) * assoc["se"])
+		}
+		data.frame(
+				model_id = model_id,
+				model_direction = ifelse(factors_as_Y, "factor_as_outcome", "metadata_as_outcome"),
+				model_type = model_type,
+				response = response,
+				mofa_factor = factor_name,
+				metadata_variable = outcome,
+				adjustment_covariates = ifelse(length(covariates) == 0L, "", paste(covariates, collapse = "; ")),
+				primary_term = ifelse(factors_as_Y, outcome, factor_name),
+				n = stats::nobs(model),
+				events = events,
+				non_events = non_events,
+				primary_estimate = unname(assoc["estimate"]),
+				primary_se = unname(assoc["se"]),
+				primary_statistic = unname(assoc["statistic"]),
+				primary_p_value = unname(assoc["p_value"]),
+				primary_ci_lower = unname(assoc["estimate"] - stats::qnorm(0.975) * assoc["se"]),
+				primary_ci_upper = unname(assoc["estimate"] + stats::qnorm(0.975) * assoc["se"]),
+				odds_ratio = or,
+				odds_ratio_ci_lower = or_lo,
+				odds_ratio_ci_upper = or_hi,
+				model_p_value = extractOverallModelPValue(model),
+				log_likelihood = log_lik,
+				aic = summary_d$aic[i],
+				bic = summary_d$bic[i],
+				r_squared = summary_d$r_squared[i],
+				adj_r_squared = summary_d$adj_r_squared[i],
+				residual_se = residual_se,
+				rmse = summary_d$rmse[i],
+				mae = summary_d$mae[i],
+				mcfadden_pseudo_r2 = summary_d$pseudo_r2[i],
+				auc = summary_d$auc[i],
+				accuracy_0.5 = summary_d$accuracy[i],
+				brier_score = summary_d$brier[i],
+				stringsAsFactors = FALSE,
+				check.names = FALSE
+		)
+	})
+	do.call(rbind, rows)
+}
+
+# Build the coefficient-level table. Each coefficient gets its own row, including
+# the intercept and dummy coefficients created for categorical predictors.
+buildExcelCoefficientRows <- function(res) {
+	rows <- lapply(seq_along(res), function(i) {
+		model <- res[[i]]
+		factor_name <- names(res)[i]
+		model_type <- getModelType(model)
+		coef_tab <- summary(model)$coefficients
+		z <- stats::qnorm(0.975)
+		d <- data.frame(
+				model_id = makeModelId(model, factor_name),
+				mofa_factor = factor_name,
+				term = ifelse(rownames(coef_tab) == "F", factor_name, rownames(coef_tab)),
+				estimate = unname(coef_tab[, "Estimate"]),
+				se = unname(coef_tab[, "Std. Error"]),
+				statistic = unname(coef_tab[, 3L]),
+				p_value = unname(coef_tab[, 4L]),
+				ci_lower = unname(coef_tab[, "Estimate"] - z * coef_tab[, "Std. Error"]),
+				ci_upper = unname(coef_tab[, "Estimate"] + z * coef_tab[, "Std. Error"]),
+				odds_ratio = NA_real_,
+				odds_ratio_ci_lower = NA_real_,
+				odds_ratio_ci_upper = NA_real_,
+				stringsAsFactors = FALSE,
+				check.names = FALSE
+		)
+		if (model_type == "logistic") {
+			d$odds_ratio <- exp(d$estimate)
+			d$odds_ratio_ci_lower <- exp(d$ci_lower)
+			d$odds_ratio_ci_upper <- exp(d$ci_upper)
+		}
+		d
+	})
+	do.call(rbind, rows)
+}
+
+makeRegressionDictionary <- function() {
+	data.frame(
+			column = c("model_id", "model_direction", "model_type", "response", "mofa_factor",
+					"metadata_variable", "adjustment_covariates", "primary_term", "n", "events",
+					"non_events", "primary_estimate", "primary_se", "primary_statistic",
+					"primary_p_value", "primary_ci_lower", "primary_ci_upper", "odds_ratio",
+					"odds_ratio_ci_lower", "odds_ratio_ci_upper", "model_p_value",
+					"log_likelihood", "aic", "bic", "r_squared", "adj_r_squared", "residual_se",
+					"rmse", "mae", "mcfadden_pseudo_r2", "auc", "accuracy_0.5", "brier_score"),
+			description = c(
+					"Actual fitted regression formula, with the MOFA factor name substituted for temporary variable F.",
+					"Whether metadata or the MOFA factor is the dependent variable.",
+					"linear or logistic.", "Dependent variable in the displayed model formula.",
+					"MOFA factor used in this model.", "Metadata variable selected through Y.",
+					"Adjustment covariates selected through X; semicolon separated.",
+					"Explanatory variable of primary interest for this workflow.",
+					"Number of observations used to fit the model.",
+					"Number of modeled positive-class observations; logistic models only.",
+					"Number of modeled reference-class observations; logistic models only.",
+					"Coefficient for the primary term; NA for a multi-level categorical primary term.",
+					"Standard error of the primary coefficient.", "t statistic for lm or z statistic for glm.",
+					"Primary-term p-value; omnibus drop1 test when appropriate.",
+					"Lower Wald 95% confidence limit for the primary coefficient.",
+					"Upper Wald 95% confidence limit for the primary coefficient.",
+					"exp(primary_estimate); logistic models only.",
+					"Lower Wald 95% confidence limit for the primary odds ratio.",
+					"Upper Wald 95% confidence limit for the primary odds ratio.",
+					"Overall model p-value versus an intercept-only model.", "Model log-likelihood.",
+					"Akaike information criterion.", "Bayesian information criterion.",
+					"Ordinary R-squared; linear models only.", "Adjusted R-squared; linear models only.",
+					"Residual standard error; linear models only.", "Root mean squared residual; linear models only.",
+					"Mean absolute residual; linear models only.",
+					"McFadden pseudo-R-squared; logistic models only.", "ROC area under the curve; logistic models only.",
+					"Classification accuracy at probability threshold 0.5; logistic models only.",
+					"Brier score; logistic models only."),
+			stringsAsFactors = FALSE,
+			check.names = FALSE
+	)
+}
+
+# Order the Models worksheet so nested/expanded versions of the same model are
+# adjacent. Within each regression direction and metadata variable, models are
+# grouped by MOFA factor and then ordered by increasing number of adjustment
+# covariates. Covariate sets of the same size retain their order in X.
+sortExcelModelRows <- function(models_d, Y_values, X_sets) {
+	if (nrow(models_d) == 0L) {
+		return(models_d)
+	}
+
+	# Reconstruct the display labels used in adjustment_covariates and associate
+	# each configured covariate set with its original position in X.
+	covariate_labels <- vapply(X_sets, function(x) {
+		if (length(x) == 0L) "" else paste(x, collapse = "; ")
+	}, character(1))
+	covariate_counts <- lengths(X_sets)
+	covariate_set_order <- match(models_d$adjustment_covariates, covariate_labels)
+	covariate_count <- covariate_counts[covariate_set_order]
+
+	# Preserve the configured Y order and the natural MOFA-factor order already
+	# produced by runRegression(), rather than sorting factor names alphabetically
+	# (which would place Factor 10 before Factor 2).
+	outcome_order <- match(models_d$metadata_variable, Y_values)
+	factor_levels <- unique(models_d$mofa_factor)
+	factor_order <- match(models_d$mofa_factor, factor_levels)
+	direction_order <- match(models_d$model_direction,
+			c("metadata_as_outcome", "factor_as_outcome"))
+
+	ord <- order(
+			direction_order,
+			outcome_order,
+			factor_order,
+			covariate_count,
+			covariate_set_order,
+			na.last = TRUE
+	)
+
+	models_d[ord, , drop = FALSE]
+}
+
+writeRegressionExcelWorkbook <- function(models_d, coefficients_d, xlsx_file) {
+	if (!requireNamespace("xlsx", quietly = TRUE)) {
+		stop("Writing the regression Excel summary requires the R package 'xlsx'.")
+	}
+	out_dir <- dirname(xlsx_file)
+	if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+	wb <- xlsx::createWorkbook()
+	add_sheet <- function(name, d) {
+		sheet <- xlsx::createSheet(wb, sheetName = name)
+		xlsx::addDataFrame(d, sheet, row.names = FALSE)
+		xlsx::autoSizeColumn(sheet, colIndex = seq_len(ncol(d)))
+	}
+	add_sheet("Models", models_d)
+	add_sheet("Coefficients", coefficients_d)
+	add_sheet("Dictionary", makeRegressionDictionary())
+	xlsx::saveWorkbook(wb, xlsx_file)
+	invisible(xlsx_file)
+}
+
+# -----------------------------------------------------------------------------
 # PDF report helper functions
 # -----------------------------------------------------------------------------
 
@@ -1769,6 +2016,11 @@ regression_report_files <- list(
 		factors_as_Y = list()
 )
 
+# Accumulate rows for one consolidated Excel workbook spanning all Y/X
+# combinations and both regression directions.
+excel_model_rows <- list()
+excel_coefficient_rows <- list()
+
 # Run both regression directions for every requested metadata variable and every
 # requested covariate set.
 for (outcome_i in Y_values) {
@@ -1831,6 +2083,16 @@ for (outcome_i in Y_values) {
 		message("Factors-as-Y regression PDF report written to: ",
 				factors_as_Y_report_fname)
 		
+		# Add both directions to the consolidated Excel summary tables.
+		excel_model_rows[[paste0(analysis_label, "__outcome_as_Y")]] <-
+				buildExcelModelRows(res_outcome_as_Y, outcome_i, covariates_i, FALSE)
+		excel_model_rows[[paste0(analysis_label, "__factors_as_Y")]] <-
+				buildExcelModelRows(res_factors_as_Y, outcome_i, covariates_i, TRUE)
+		excel_coefficient_rows[[paste0(analysis_label, "__outcome_as_Y")]] <-
+				buildExcelCoefficientRows(res_outcome_as_Y)
+		excel_coefficient_rows[[paste0(analysis_label, "__factors_as_Y")]] <-
+				buildExcelCoefficientRows(res_factors_as_Y)
+		
 		res$outcome_as_Y[[analysis_label]] <- res_outcome_as_Y
 		res$factors_as_Y[[analysis_label]] <- res_factors_as_Y
 		report_summary_d$outcome_as_Y[[analysis_label]] <- outcome_as_Y_report_summary_d
@@ -1841,6 +2103,40 @@ for (outcome_i in Y_values) {
 				factors_as_Y_report_fname
 	}
 }
+
+# Write one workbook after all requested models have been fitted.
+regression_models_d <- do.call(rbind, excel_model_rows)
+rownames(regression_models_d) <- NULL
+
+# Arrange the Models worksheet for side-by-side inspection of nested models:
+# unadjusted first, followed by models with progressively more covariates.
+regression_models_d <- sortExcelModelRows(regression_models_d, Y_values, X_sets)
+rownames(regression_models_d) <- NULL
+
+regression_coefficients_d <- do.call(rbind, excel_coefficient_rows)
+rownames(regression_coefficients_d) <- NULL
+regression_excel_file <- file.path(
+		regression_output_root, "regression_analysis", "regression_model_summary.xlsx")
+writeRegressionExcelWorkbook(
+		models_d = regression_models_d,
+		coefficients_d = regression_coefficients_d,
+		xlsx_file = regression_excel_file
+)
+message("Consolidated regression Excel summary written to: ", regression_excel_file)
+
+# Store the same three tables in an RDS file. Each Excel worksheet is represented
+# by one named list entry and is converted to a data matrix, as requested. Because
+# the tables contain both character and numeric columns, R's matrix representation
+# necessarily stores their values using a common (character) type.
+regression_rds_data <- list(
+		Models = as.matrix(regression_models_d),
+		Coefficients = as.matrix(regression_coefficients_d),
+		Dictionary = as.matrix(makeRegressionDictionary())
+)
+regression_rds_file <- file.path(
+		regression_output_root, "regression_analysis", "regression_model_summary.rds")
+saveRDS(regression_rds_data, regression_rds_file)
+message("Consolidated regression RDS summary written to: ", regression_rds_file)
 
 # Example inspection commands; uncomment after running the script if desired.
 # names(res$outcome_as_Y)

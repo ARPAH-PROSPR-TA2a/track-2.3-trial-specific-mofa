@@ -36,9 +36,11 @@ below.
 | `file_readers.R` | Study-specific file-reader functions used to convert the clinical and omics input files into the formats expected by the workflow. It currently contains `readPhenoData()`, `readMethylation()`, `readProteomics()`, and `readMetabolomics()`. |
 | `methods.R` | Shared helper functions used by `mofa_analysis.R`, `mofa_train_glm.R`, `glm_factor_estimate.R`, and `project_mofa_factors.R`, including clinical configuration validation, sample-ID construction, timepoint/change-score handling, omics loading/preparation, and feature scaling. |
 | `regression_parameters.R` | Configuration file for `regress_mofa_factors.R`. Selects the regression input source and defines metadata variables, covariate sets, and categorical variables. |
-| `regress_mofa_factors.R` | Runs regression between selected metadata variables and every available MOFA factor (in both directions, factor as the predictor and as the response variable) for multiple user-configured covariate sets, and generates PDF reports. |
-| `mofa_plots_report.Rmd` | Parameterized R Markdown report for visual inspection of a fitted MOFA model. |
-| `mofa_factor_interpretation.R` | Biological interpretation workflow for fitted MOFA factors. |
+| `regress_mofa_factors.R` | Runs regression between selected metadata variables and every available MOFA factor (in both directions, factor as the predictor and as the response variable) for multiple user-configured covariate sets, generates PDF reports, and writes consolidated Excel and RDS summaries of the fitted models and coefficients. |
+| `mofa_plots_report_parameters.R` | Configuration file for `mofa_plots_report.Rmd`. Identifies the fitted MOFA model and controls the metadata variables, factors, views, feature-weight plots, heatmaps, and dimensionality-reduction analyses included in the report. |
+| `mofa_plots_report.Rmd` | R Markdown report for visual inspection of a fitted MOFA model. User-configurable settings are read from `mofa_plots_report_parameters.R`. |
+| `mofa_factors_interpretation_parameters.R` | Configuration file for `mofa_factor_interpretation.R`. Identifies the fitted MOFA model and optional Metabolon annotation file and controls view/factor selection, feature-selection settings, GO ontologies, significance thresholds, report generation, and parallelization. |
+| `mofa_factor_interpretation.R` | Biological interpretation workflow for fitted MOFA factors. Performs ranked GO enrichment for gene-oriented views, Metabolon over-representation analysis, and optional PDF reporting. |
 | `mofa_train_glm_parameters.R` | Configuration file for `mofa_train_glm.R`. Identifies the fitted MOFA model and controls factor/view selection, repeated validation, elastic-net settings, parallelization, and the training report. |
 | `mofa_train_glm.R` | Trains view-specific LASSO/elastic-net models that predict the learned MOFA factors from individual omics views. The resulting predictor object is used for later external factor estimation. |
 | `glm_factor_estimate_parameters.R` | Configuration file for applying trained GLM factor predictors to an external study. Defines the trained predictor, external data files, preprocessing, and prediction options. |
@@ -61,14 +63,18 @@ library(xlsx)
 is enabled, `future` and `future.apply`. Its training report uses `ggplot2`.
 
 `regress_mofa_factors.R` uses the standard R modeling functions and `xlsx`
-when the persisted Excel input mode is selected.
+for Excel input/output. It also writes an RDS copy of the consolidated
+regression-summary tables using base R.
 
 The plotting report uses `ggplot2`, `corrplot`, `rmarkdown`, and MOFA2 plotting
 functions. Rendering to PDF requires a working LaTeX installation.
 
-The factor-interpretation workflow has additional Bioconductor/CRAN
-requirements, including packages used for annotation and enrichment analysis;
-see the documentation in `mofa_factor_interpretation.R` for the current list.
+The factor-interpretation workflow additionally uses packages for annotation,
+enrichment analysis, Excel output, and report generation, including `fgsea`,
+`missMethyl`, `AnnotationDbi`, `org.Hs.eg.db`, `GO.db`, `clusterProfiler`,
+`xlsx`, and `rmarkdown`. Parallel execution on Windows uses `future` and
+`future.apply`. See the documentation in `mofa_factor_interpretation.R` for
+the current requirements.
 
 MOFA2 uses the Python package `mofapy2` under the hood. The main MOFA workflow
 runs MOFA with `use_basilisk = TRUE`, allowing `basilisk` to manage the Python
@@ -91,7 +97,8 @@ settings belong in `mofa_parameters.R`:
 - feature-selection and MOFA training settings
 
 The downstream workflows follow the same pattern. For example,
-`regression_parameters.R`, `mofa_train_glm_parameters.R`, 
+`regression_parameters.R`, `mofa_plots_report_parameters.R`,
+`mofa_factors_interpretation_parameters.R`, `mofa_train_glm_parameters.R`,
 `glm_factor_estimate_parameters.R`, and `project_mofa_factors_parameters.R`
 contain the settings specific to those workflows.
 
@@ -428,13 +435,49 @@ regression_analysis/outcome_as_Y/mofa_factor_regression_report_Y=CR_covar=none.p
 regression_analysis/factors_as_Y/mofa_factor_regression_report_Y=CR_covar=female+race.pdf
 ```
 
+In addition to the PDF reports, the script writes two consolidated summary
+files in the `regression_analysis` directory:
+
+```text
+regression_analysis/regression_model_summary.xlsx
+regression_analysis/regression_model_summary.rds
+```
+
+The Excel workbook contains three worksheets:
+
+- `Models` contains one row per fitted model. The model ID is the actual
+  regression formula, with the specific MOFA factor name substituted for the
+  temporary internal factor variable. Models are grouped by regression
+  direction, metadata variable, and MOFA factor, and are ordered by increasing
+  number of adjustment covariates so that nested or progressively adjusted
+  models can be inspected together. Covariate sets of the same size retain
+  their order in `X`.
+- `Coefficients` contains one row per regression coefficient, including
+  adjustment-covariate coefficients and categorical contrasts. For logistic
+  regression, both log-odds coefficients and exponentiated odds ratios with
+  confidence intervals are retained.
+- `Dictionary` describes the columns in the `Models` worksheet.
+
+The `Models` worksheet includes the association estimate, standard error,
+confidence interval, p-value, sample size, AIC, BIC, log likelihood, and
+regression-type-specific fit/performance measures. Linear models include
+R-squared, adjusted R-squared, RMSE, and MAE. Logistic models include McFadden
+pseudo-R-squared, AUC, accuracy, Brier score, outcome-event counts, and odds
+ratios with confidence intervals where a single association coefficient is
+defined. Fields that do not apply to a model type are left blank.
+
+The RDS file stores the same three tables as a named list with entries
+`Models`, `Coefficients`, and `Dictionary`. Each entry is stored as a data
+matrix. Because each table contains both numeric and character fields, the
+matrix representation is character-valued.
+
 The script also creates an in-memory object named `res` containing the fitted
 models, separated into `res$outcome_as_Y` and `res$factors_as_Y`. The report
 summaries and generated PDF paths are similarly retained in memory for
 interactive inspection.
 
-The regression step does not write a separate master RDS containing `res`; the
-fitted-model object remains available in the R session in which the script is
+The regression-summary RDS file does not contain the fitted model objects in
+`res`; those objects remain available in the R session in which the script is
 run.
 
 # 3. Visualize the fitted MOFA model with `mofa_plots_report.Rmd` (optional)
@@ -442,31 +485,40 @@ run.
 The plotting report reads an existing fitted `model.hdf5` file and generates
 exploratory plots. It does not refit MOFA.
 
-## Configure the report
+## Configure `mofa_plots_report_parameters.R`
 
-The YAML header at the beginning of `mofa_plots_report.Rmd` contains the
-user-configurable parameters. The most important is:
+Before rendering the report, edit the companion
+`mofa_plots_report_parameters.R` file. It should be located in the same
+directory as `mofa_plots_report.Rmd`; the report sources this file from its
+setup chunk.
+
+The most important setting is:
 
 ```r
-mofa_res_fname: !r "path/to/model.hdf5"
+mofa_res_fname <- "path/to/model.hdf5"
 ```
 
-Other parameters control:
+The remaining settings control:
 
 - the continuous metadata columns to correlate with factors (`col_names_to_use`) in the factors x metadata correlation plot;
 - the subset of "interesting" factors to utilize in detailed factor-specific plots (`sel_facs`);
 - the metadata variable used in those more focused plots (`metadata_col`);
-- the factor and number of features used for top-weight displays;
-- the views used for top-weight plots;
-- the factor and number of features used for sample heatmaps;
-- the views used for heatmaps;
-- the metadata columns used to annotate samples in the heatmap; and
-- whether dimensionality-reduction plots are generated.
+- the factor and number of features used for top-weight displays (`top_weight_factor` and `top_weight_nfeatures`);
+- the views used for top-weight plots (`top_weight_views`);
+- the factor and number of features used for sample heatmaps (`heatmap_factor` and `heatmap_features`);
+- the views used for heatmaps (`heatmap_views`);
+- the metadata columns used to annotate samples in the heatmap (`heatmap_annotation_samples`); and
+- whether dimensionality-reduction plots are generated (`run_dimred`).
 
-The top of the `.Rmd` file contains documentation of these parameters and
-should be read before changing them.
+The parameter file contains user-level comments describing these settings.
+Study- or run-specific plotting choices should normally be made there rather
+than by editing `mofa_plots_report.Rmd`.
 
 ## Render the report
+
+Keep `mofa_plots_report.Rmd` and `mofa_plots_report_parameters.R` in the same
+directory. When the report is rendered, its setup code sources the parameter
+file and the remainder of the report uses the variables defined there.
 
 For example, to render HTML:
 
@@ -492,54 +544,129 @@ The rendered HTML/PDF file is the principal output of this step.
 # 4. Interpret MOFA factors biologically with `mofa_factor_interpretation.R`
 
 After the model has been fitted and the relevant factors have been identified,
-`mofa_factor_interpretation.R` can be used to generate a biological
-interpretation report. 
+`mofa_factor_interpretation.R` can be used to generate biological enrichment
+results and an optional factor-by-factor interpretation report.
 
 The script extracts feature loadings from the fitted MOFA model and performs
 view-specific enrichment analyses. The current implementation includes:
 
-- signed ranked `fgsea` analysis for gene-oriented views such as expression,
-  proteomics, and methylation;
+- signed ranked GO enrichment with `fgsea` for expression, proteomics, and
+  methylation, using the full signed loading vector for each factor/view;
 - mapping of proteomics features from UniProt identifiers to Entrez IDs;
 - mapping of methylation CpG identifiers to Entrez IDs using `missMethyl`;
-- interpretation of expression identifiers as Entrez IDs or gene symbols; and
-- Metabolon pathway/category overrepresentation analysis for metabolomics.
+- interpretation of expression identifiers as Entrez IDs or gene symbols;
+- separate `fgsea` analyses for each requested GO ontology (`"BP"`, `"MF"`,
+  and/or `"CC"`), so multiple-testing adjustment remains ontology-specific; and
+- Metabolon pathway/category over-representation analysis (ORA) for the
+  positive and negative high-loading metabolite sets.
 
-A typical invocation supplies the fitted MOFA model, the metabolomics
-annotation table when needed, and an output directory, for example:
+For the ranked analyses, the report uses the direction label `ranked`, because
+positive and negative loadings are analyzed together in one signed ranking.
+The sign of the normalized enrichment score (`NES`) indicates the end of the
+ranking toward which a GO term is enriched. Metabolomics ORA uses separate 
+`positive` and `negative` selected-feature groups.
+
+## Configure `mofa_factors_interpretation_parameters.R`
+
+Before running the script, edit the companion
+`mofa_factors_interpretation_parameters.R` file. It must be located in the same
+directory as `mofa_factor_interpretation.R`.
+
+The user-configurable settings are:
+
+| Variable | Meaning |
+|---|---|
+| `mofa_res_fname` | Full path to the `model.hdf5` produced by `mofa_analysis.R`. |
+| `metab_ann_fn` | Full path to the Metabolon annotation CSV file. This may be `NULL` when the MOFA model does not contain a `metabolomics` view. |
+| `output_dir` | Parent directory in which the `mofa_factor_interpretation` results folder is created. If `NULL`, that folder is created alongside `mofa_res_fname`. |
+| `views` | MOFA views to analyze. Use `"all"` for all views in the fitted model, or provide a character vector of view names. |
+| `factors` | MOFA factors to analyze. Use `"all"` for all factors or specify the factor selection accepted by `MOFA2::get_weights()`. |
+| `selection_mode` | High-loading feature-selection rule used for outputs and metabolomics ORA: `"top_n"`, `"zscore"`, or `"quantile"`. |
+| `top_n` | Number of positive and negative features selected per factor/view when `selection_mode = "top_n"`. |
+| `z_cutoff` | Absolute loading z-score threshold when `selection_mode = "zscore"`. |
+| `quantile_cutoff` | Absolute-loading quantile threshold when `selection_mode = "quantile"`. |
+| `go_ontology` | One or more GO namespaces to analyze with `fgsea`: `"BP"`, `"MF"`, and/or `"CC"`. Each ontology is analyzed separately and the results are combined. |
+| `qvalue_cutoff` | Maximum adjusted p-value retained in the enrichment results. The cutoff is applied uniformly to `fgsea` and metabolomics ORA results. |
+| `report_significance_cutoff` | Adjusted p-value threshold used for enrichment terms shown in the PDF report and included in the factor-level interpretation text. |
+| `render_report` | Whether to generate the PDF factor-interpretation report. |
+| `n_cores` | Number of task-level parallel workers. Use `1` for serial execution; on Windows, parallel execution requires `future` and `future.apply`. |
+
+Other arguments of `run_mofa_integrative_interpretation()` retain the values
+specified by the workflow itself rather than being exposed in the parameter
+file. In particular, the standard pipeline uses the `base_pdf` report engine
+and `fgsea_nproc = 1`; task-level parallelization is controlled by `n_cores`.
+
+The feature-selection settings (`selection_mode`, `top_n`, `z_cutoff`, and
+`quantile_cutoff`) determine the high-loading feature sets used for
+metabolomics ORA. Expression, proteomics, and methylation enrichment instead
+uses the full signed loading ranking for each factor/view.
+
+## Run `mofa_factor_interpretation.R`
+
+As with the other parameterized scripts in the repository, run the script with
+`chdir = TRUE` so that it can source its companion parameter file by name. From
+an R session:
 
 ```r
-mofa_obj <- MOFA2::load_model(mofa_res_fname)
-
-res <- run_mofa_integrative_interpretation(
-  mofa_obj = mofa_obj,
-  metabolon_annotation = metabolon_annot,
-  output_dir = "mofa_factor_interpretation_report",
-  metabolomics_feature_col = "BIOCHEMICAL",
-  expression_id_type = "auto",
-  methylation_array_type = "EPIC",
-  report_significance_cutoff = 0.05,
-  render_report = TRUE,
-  include_top_features_in_report = FALSE,
-  report_engine = "base_pdf",
-  n_cores = 4,
-  fgsea_nproc = 1
+source(
+  "/path_to_mofa_files/mofa_factor_interpretation.R",
+  local = TRUE,
+  chdir = TRUE
 )
 ```
 
-The default `base_pdf` report engine writes a PDF directly using base R and
-therefore does not require Pandoc or LaTeX. The optional `rmarkdown_pdf`
-engine requires Pandoc and LaTeX.
+or from the command line:
 
-The principal outputs are:
+```text
+Rscript.exe -e "source('/path_to_mofa_files/mofa_factor_interpretation.R', local = TRUE, chdir = TRUE)"
+```
+
+The script loads the fitted MOFA model specified by `mofa_res_fname`, expands
+`views = "all"` to the views present in the model, reads the Metabolon
+annotation when a metabolomics view is present, and then calls
+`run_mofa_integrative_interpretation()` with the configured settings.
+
+The default `base_pdf` report engine writes a landscape PDF directly using base
+R graphics and therefore does not require Pandoc or LaTeX. The underlying
+analysis function also supports an optional `rmarkdown_pdf` engine, which
+requires Pandoc and LaTeX, but this setting is not exposed in the standard
+parameter file.
+
+## Enrichment-result filtering and output
+
+`qvalue_cutoff` controls which enrichment results are retained in the analysis
+outputs. For GO `fgsea`, adjusted p-values are calculated separately within
+each requested ontology. The same cutoff is applied to metabolomics ORA after
+the enrichment results are combined, so the persisted enrichment table uses a
+consistent adjusted-p-value threshold across methods.
+
+`report_significance_cutoff` is a separate, typically stricter threshold used
+only for the PDF report and factor-level interpretation text. Thus, the Excel
+and RDS results may contain terms that pass `qvalue_cutoff` but do not pass
+`report_significance_cutoff` and therefore do not appear in the report.
+
+The output filenames include the requested GO ontology or ontologies. For
+example, with:
+
+```r
+go_ontology <- c("BP", "MF", "CC")
+```
+
+the suffix is `BP_MF_CC`.
+
+The principal outputs in the `mofa_factor_interpretation` results folder are:
 
 | Output | Description |
 |---|---|
-| `mofa_integrative_factor_report.pdf` | PDF report summarizing factor-level enrichment and interpretation results. |
-| `enrichment_results.csv` | Machine-readable enrichment results across factors and views. |
-| `top_factor_features.csv` | Top-loading features by factor and view. |
-| `selected_factor_features.csv` | Features selected by the configured loading-selection rule, used particularly for set-based metabolomics enrichment. |
-| `all_mofa_loadings.csv` | Full extracted MOFA loading table. |
+| `mofa_integrative_factor_report_<ontologies>.pdf` | Optional landscape PDF report containing factor-level interpretation text, variance-explained information, and significant enrichment results. Generated when `render_report = TRUE`. |
+| `enrichment_results_<ontologies>.xlsx` | Enrichment results across the selected factors and views. The workbook includes explanatory comments on recognized column headers. Results are reported using a consolidated schema shared by `fgsea` and metabolomics ORA. |
+| `mofa_integrative_results_<ontologies>.rds` | Condensed R results object containing only `enrichment_results`, `interpretations`, and `parameters`. |
+
+The full analysis result list, including loadings, selected features, top
+features, and variance explained, remains available in the in-memory object
+`res` during an interactive run. The standard scripted workflow does not write
+the optional loading/feature Excel files because `save_loadings` retains its
+default value of `FALSE`.
 
 # 5. Train external factor predictors with `mofa_train_glm.R`
 
@@ -778,12 +905,17 @@ For a new study, the intended workflow is:
 2. **Configure and run `regress_mofa_factors.R`.** Edit
    `regression_parameters.R` to select either the fitted MOFA model or 
    persisted metadata/factor-value files, set `sample_id_col`, and specify `Y`,
-   `X`, and `categorical`. Review both sets of regression PDF reports.
-3. **Optionally render `mofa_plots_report.Rmd`.** Edit its YAML parameters to
-   point to the fitted `model.hdf5` and select the factors, metadata variables,
-   views, and heatmap settings of interest.
-4. **Run `mofa_factor_interpretation.R`.** Use the fitted MOFA model to generate
-   biological interpretation/enrichment results for the factors of interest.
+   `X`, and `categorical`. Review both sets of regression PDF reports and the
+   consolidated `regression_model_summary.xlsx`/`.rds` model summaries.
+3. **Optionally render `mofa_plots_report.Rmd`.** Edit
+   `mofa_plots_report_parameters.R` to point to the fitted `model.hdf5` and
+   select the factors, metadata variables, views, feature-weight, heatmap, and
+   dimensionality-reduction settings of interest.
+4. **Configure and run `mofa_factor_interpretation.R`.** Edit
+   `mofa_factors_interpretation_parameters.R` to identify the fitted MOFA model,
+   select the factors/views and GO ontologies to analyze, set enrichment/report
+   thresholds, and configure parallelization. Review the generated enrichment
+   workbook and optional PDF interpretation report.
 5. **Configure and run `mofa_train_glm.R`.** Edit
    `mofa_train_glm_parameters.R` to point to the `model.hdf5` file and select
    the factors/views to evaluate. Use the training report and internal-CV

@@ -11,49 +11,6 @@ output:
   pdf_document:
     toc: true
     number_sections: true
-params:
-  # Specify the location of the MOFA results file generated MOFA_analysis.R
-  mofa_res_fname: !r file.path("D:/R_sessions/PROSPR/MOFA/reliable_probes", "2026_Aug_19_11_55_54_visit=24mo_change_scores_ungrouped_views=me+pr+mb", "model.hdf5")
-  # Specify the continuous covariates for which correlations with each MOFA factor
-  # will be computed. Each covariate must correspond to a column in the clinical
-  # metadata file used for the MOFA_analysis.R run.
-  col_names_to_use: !r c("CR", "agebl", "female", "bmistrat", "teerq", "tee86", "teeresid", "rmrresid", "coretemp", "cortempd", "cortempn", "pctcr", "mclinwt", "mbmi", "blclinwt", "deltawtb", "pdeltawt")
-  # Specify the factors to include in the detailed factor-specific plots. These
-  # plots are intended for closer examination of factors meaningfully associated
-  # with covariates of interest, as identified by the factor regression analysis.
-  # Thus, the results of the regression analysis should guide the selection of
-  # factors specified here. It is recommended to select no more than 4-5 factors
-  # to ensure that the resulting plots remain legible.
-  sel_facs: !r c(15, 23, 11, 27, 21, 20) #c(22, 24, 15, 27)
-  # The covariate to use in the detailed factor-specific plots. This typically 
-  # the showing the stronger association with most factors. To identify this 
-  # covariate, generate the plot report once, inspect the plot showing the 
-  # association between factors and clinical covariates, specify the covariate 
-  # of interest below based on that plot, and re-generate the plot report.
-  metadata_col: "deltawtb"
-  # Factor to use for examining feature weights. This is typically the most 
-  # interesting factor, as determined by the regression analysis or/and the
-  # plot showing the association between factors and clinical covariates.
-  top_weight_factor: 15
-  # Number of feature weight to display for the top_weight_factor
-  top_weight_nfeatures: 50
-  # Specify which views to display feature weights for.
-  top_weight_views: !r c("methylation") # c("metabolomics", "proteomics")
-  # Specify factor to use for selecting features to be used for sample
-  # clustering 
-  heatmap_factor: 15
-  # Specify the number of features to use for sample clustering. Samples will
-  # be clustered using the top heatmap_features with the highest absolute
-  # weight for factor heatmap_factor.
-  heatmap_features: 50
-  # Specify which views to use for clustering . In each view, samples will
-  # be clustered using the view-specific measurements of the heatmap_features
-  # features specificed above.
-  heatmap_views: !r c("metabolomics", "proteomics", "methylation")
-  # Covariates to use for annotating samples in the clustering dendrogram
-  # plot.
-  heatmap_annotation_samples: !r c("CR", "deltawtb")
-  run_dimred: true
 ---
 
 
@@ -66,11 +23,14 @@ knitr::opts_chunk$set(
   fig.height = 7,
   fig.align = "center"
 )
+
+# Load user-configurable report settings from the companion parameter file.
+source("mofa_plots_report_parameters.R", local = TRUE)
 ```
 
 # Overview
 
-This report reads a fitted MOFA results object and generates diagnostic and exploratory plots using `MOFA2`. The workflow assumes that MOFA analysis has already been performed and that the fitted model is stored in the file specified by `params$mofa_res_fname`.
+This report reads a fitted MOFA results object and generates diagnostic and exploratory plots using `MOFA2`. The workflow assumes that MOFA analysis has already been performed and that the fitted model is stored in the file specified by `mofa_res_fname`.
 
 Additional plotting options are available in the MOFA2 reference manual and tutorials.
 
@@ -84,17 +44,30 @@ library(corrplot)
 
 # Report parameters
 
-The main user-adjustable parameters are defined in the YAML header at the top of this `.Rmd` file. They can also be overridden when calling `rmarkdown::render()`.
+The main user-adjustable settings are defined in `mofa_plots_report_parameters.R`,
+which is sourced by the setup chunk at the beginning of this report. Edit that
+file before rendering the report.
 
 ```{r show-parameters}
-params
+list(
+  mofa_res_fname = mofa_res_fname,
+  col_names_to_use = col_names_to_use,
+  sel_facs = sel_facs,
+  metadata_col = metadata_col,
+  top_weight_factor = top_weight_factor,
+  top_weight_nfeatures = top_weight_nfeatures,
+  top_weight_views = top_weight_views,
+  heatmap_factor = heatmap_factor,
+  heatmap_features = heatmap_features,
+  heatmap_views = heatmap_views,
+  heatmap_annotation_samples = heatmap_annotation_samples,
+  run_dimred = run_dimred
+)
 ```
 
 # Load MOFA model
 
 ```{r load-model}
-mofa_res_fname <- params$mofa_res_fname
-
 if (!file.exists(mofa_res_fname)) {
   stop("The MOFA results file does not exist: ", mofa_res_fname)
 }
@@ -154,13 +127,11 @@ corrplot(cor(factor_values))
 
 # Association between factors and clinical covariates
 
-The covariates tested here are controlled by `params$col_names_to_use`.
+The covariates tested here are controlled by `col_names_to_use`.
 
 `correlate_factors_with_covariates()` computes the Pearson correlation between each factor and each covariate and uses a t-test to assign a p-value to that correlation. For categorical covariates, MOFA2 converts covariates to factor levels, so the p-values are most interpretable for binary categorical covariates.
 
 ```{r factor-covariate-logp, fig.width=11, fig.height=8}
-col_names_to_use <- params$col_names_to_use
-
 correlate_factors_with_covariates(
   model,
   col_names_to_use,
@@ -179,12 +150,9 @@ correlate_factors_with_covariates(
 
 # Selected factor plots
 
-The selected factors are controlled by `params$sel_facs`, and the metadata column used for coloring is controlled by `params$metadata_col`.
+The selected factors are controlled by `sel_facs`, and the metadata column used for coloring is controlled by `metadata_col`.
 
 ```{r selected-factor-settings}
-sel_facs <- params$sel_facs
-metadata_col <- params$metadata_col
-
 sel_facs
 metadata_col
 ```
@@ -223,10 +191,6 @@ plot_factors(
 These plots show features with the largest weights for a selected factor and view. This can help identify features that are strongly associated with the selected factor.
 
 ```{r top-weight-settings}
-top_weight_factor <- params$top_weight_factor
-top_weight_nfeatures <- params$top_weight_nfeatures
-top_weight_views <- params$top_weight_views
-
 top_weight_factor
 top_weight_nfeatures
 top_weight_views
@@ -250,29 +214,24 @@ for (view_i in top_weight_views) {
 
 The following section uses the learned factor values to run t-SNE and UMAP on the sample space, then colors samples by the selected metadata column. The embedding methods are stochastic, so results may vary across runs unless the relevant underlying functions control the random seed.
 
-```{r run-dimensionality-reduction, eval=params$run_dimred}
+```{r run-dimensionality-reduction, eval=run_dimred}
 model <- run_tsne(model)
 model <- run_umap(model)
 ```
 
-```{r plot-tsne, fig.width=9, fig.height=7, eval=params$run_dimred}
+```{r plot-tsne, fig.width=9, fig.height=7, eval=run_dimred}
 plot_dimred(model, method = "TSNE", color_by = metadata_col)
 ```
 
-```{r plot-umap, fig.width=9, fig.height=7, eval=params$run_dimred}
+```{r plot-umap, fig.width=9, fig.height=7, eval=run_dimred}
 plot_dimred(model, method = "UMAP", color_by = metadata_col)
 ```
 
 # Data heatmaps
 
-These heatmaps cluster a view using the features with the highest absolute weights for a selected factor. Clustering is performed using the measurements in the view data matrix on which MOFA was trained. The sample annotations are controlled by `params$heatmap_annotation_samples`.
+These heatmaps cluster a view using the features with the highest absolute weights for a selected factor. Clustering is performed using the measurements in the view data matrix on which MOFA was trained. The sample annotations are controlled by `heatmap_annotation_samples`.
 
 ```{r heatmap-settings}
-heatmap_factor <- params$heatmap_factor
-heatmap_features <- params$heatmap_features
-heatmap_views <- params$heatmap_views
-heatmap_annotation_samples <- params$heatmap_annotation_samples
-
 heatmap_factor
 heatmap_features
 heatmap_views

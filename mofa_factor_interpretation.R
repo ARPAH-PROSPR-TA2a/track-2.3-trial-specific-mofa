@@ -6,6 +6,30 @@
 #   a factor-by-factor PDF report with top features, enriched terms, and a
 #   cautious biological interpretation.
 #
+# Configuration:
+#   User-configurable run settings are specified in the companion parameter file
+#   mofa_factors_interpretation_parameters.R, which must be located in the same
+#   directory as this script. To keep things simple, the settings specified in the
+#	parameters file are only a subset of the full set of arguments accepted by method 
+#	run_mofa_integrative_interpretation.
+#
+# Execution:
+#   After editing mofa_factors_interpretation_parameters.R, run this script either
+#   from an R session with chdir = TRUE and local = TRUE:
+#
+#     source("path_to_mofa_code/mofa_factor_interpretation.R",
+#            chdir = TRUE, local = TRUE)
+#
+#   or from a command prompt with Rscript.exe by sourcing the script with the
+#   same working-directory behavior:
+#
+#     Rscript.exe -e "source('path_to_mofa_code/mofa_factor_interpretation.R',
+#                       local = TRUE, chdir = TRUE)"
+#
+#   In both cases, chdir = TRUE temporarily sets the working directory to the
+#   directory containing this script, allowing the companion parameter file to
+#   be sourced by name.
+#
 # Supported MOFA view names:
 #   proteomics     features are UniProt IDs
 #   methylation    features are Illumina CpG IDs
@@ -16,18 +40,20 @@
 #   1. Extract MOFA weights/loadings.
 #   2. Select high-loading features for outputs and for metabolomics ORA.
 #   3. Run view-appropriate enrichment:
-#        - proteomics: UniProt -> Entrez -> one signed ranked GO fgsea run per factor/view
-#        - expression: Entrez or symbol -> Entrez -> one signed ranked GO fgsea run per factor/view
-#        - methylation: CpG -> Entrez mapping via missMethyl, followed by one signed ranked GO fgsea run per factor/view
-#        - metabolomics: positive/negative Metabolon SUPER_PATHWAY / SUB_PATHWAY / classification ORA
+#        - proteomics: UniProt -> Entrez -> signed ranked GO fgsea per factor/view/ontology
+#        - expression: Entrez or symbol -> Entrez -> signed ranked GO fgsea
+#          per factor/view/ontology
+#        - methylation: CpG -> Entrez mapping via missMethyl, followed by signed
+#          ranked GO fgsea per factor/view/ontology
+#        - metabolomics: positive/negative Metabolon SUPER_PATHWAY / SUB_PATHWAY /
+#          classification ORA
 #   4. Render a report.
 #
 # Notes:
 #   - The script is intentionally conservative. It produces plausible biological
 #     summaries, but it does not claim causality.
 #   - You should review the generated interpretations manually.
-#   - For methylation, set methylation_array_type to the appropriate value for
-#     your array, usually "EPIC".
+#   - For methylation, the current analysis-function default array type is "EPIC".
 #   - The default base_pdf report engine does not require Pandoc or LaTeX.
 #   - Enrichment tasks can be parallelized with n_cores > 1.
 #   - The optional rmarkdown_pdf report engine requires Pandoc plus a LaTeX
@@ -180,6 +206,40 @@ validate_views <- function(views) {
 		)
 	}
 	intersect(unique(views), supported)
+}
+
+#' Validate requested Gene Ontology namespaces.
+#'
+#' Normalizes one or more requested GO ontology codes and verifies that every
+#' value is one of Biological Process (`"BP"`), Molecular Function (`"MF"`),
+#' or Cellular Component (`"CC"`). Duplicate ontology codes are removed while
+#' preserving their first-occurrence order.
+#'
+#' @param go_ontology Character vector containing one or more of `"BP"`, `"MF"`,
+#'   and `"CC"`.
+#'
+#' @return Character vector of unique, validated GO ontology codes.
+validate_go_ontologies <- function(go_ontology) {
+	# Normalize case and surrounding whitespace so values such as "bp" are accepted.
+	go_ontology <- unique(toupper(trimws(as.character(go_ontology))))
+	go_ontology <- go_ontology[!is.na(go_ontology) & nzchar(go_ontology)]
+
+	if (length(go_ontology) == 0) {
+		stop("At least one GO ontology must be specified.", call. = FALSE)
+	}
+
+	supported <- c("BP", "MF", "CC")
+	unsupported <- setdiff(go_ontology, supported)
+	if (length(unsupported) > 0) {
+		stop(
+				"Unsupported GO ontology value(s): ",
+				paste(unsupported, collapse = ", "),
+				". Supported values are BP, MF, and CC.",
+				call. = FALSE
+		)
+	}
+
+	go_ontology
 }
 
 # -----------------------------------------------------------------------------
@@ -593,7 +653,7 @@ run_gene_enrichment_bundle <- function(selected_entrez,
 							qvalue_cutoff = qvalue_cutoff
 					)
 			) %>%
-			mutate(across(any_of(c("pvalue", "p.adjust", "qvalue")), as.numeric)) %>%
+			mutate(across(any_of(c("pvalue", "p.adjust")), as.numeric)) %>%
 			arrange(p.adjust)
 }
 
@@ -720,67 +780,85 @@ lookup_go_descriptions <- function(go_ids) {
 #' @param fgsea_nproc Number of CPUs passed to `fgsea::fgsea()` for within-task
 #'   parallelization. When `run_all_enrichments()` is already using multiple
 #'   task-level workers, keep this at `1` to avoid oversubscribing CPUs.
+#' @param go_pathways Optional precomputed GO pathway list. When supplied, the
+#'   function skips rebuilding GO gene sets inside each worker.
+#' @param go_descriptions Optional precomputed GO term descriptions. When
+#'   supplied, the function skips GO.db lookups inside each worker.
 #'
 #' @return Tibble of fgsea GO results, or an empty tibble.
 run_fgsea_go_enrichment <- function(mapped_loadings,
-		OrgDb = "org.Hs.eg.db",
-		ontology = "BP",
-		p_adjust_method = "BH",
-		qvalue_cutoff = 0.25,
-		min_gene_set_size = 10,
-		max_gene_set_size = 500,
-		fgsea_nproc = 1L) {
-	# fgsea is the primary ranked enrichment method for gene/protein views.
-	require_namespace("fgsea", "ranked GO enrichment")
-	
-	# Validate the requested within-fgsea CPU count.
-	fgsea_nproc <- normalize_n_cores(fgsea_nproc)
-	
-	# Convert feature-level signed loadings to one ranked score per Entrez gene.
-	stats <- collapse_ranked_gene_scores(mapped_loadings)
-	# fgsea cannot test gene sets larger than the available ranked universe.
-	# If the ranked vector is smaller than the requested minimum gene-set size,
-	# no pathway can satisfy the size filter.
-	if (length(stats) < min_gene_set_size) return(tibble())
-	
-	# Build GO gene sets and restrict them to genes observed in this MOFA view.
-	pathways <- build_go_pathways_for_fgsea(OrgDb = OrgDb, ontology = ontology)
-	pathways <- purrr::map(pathways, ~ intersect(.x, names(stats)))
-	pathways <- pathways[lengths(pathways) >= min_gene_set_size & lengths(pathways) <= max_gene_set_size]
-	if (length(pathways) == 0) return(tibble())
-	
-	# Run preranked enrichment using signed MOFA loadings.
-	fg <- tryCatch({
-		fgsea::fgsea(
-				pathways = pathways,
-				stats = stats,
-				minSize = min_gene_set_size,
-				maxSize = max_gene_set_size,
-				nproc = fgsea_nproc
-		)
-	}, error = function(e) NULL)
-	
-	if (is.null(fg) || nrow(fg) == 0) return(tibble())
-	
-	fg <- as_tibble(fg)
-	go_descriptions <- lookup_go_descriptions(fg$pathway)
-	
-	fg %>%
-			mutate(
-					database = paste0("GO_", ontology, "_fgsea"),
-					ID = as.character(pathway),
-					Description = unname(go_descriptions[ID]),
-					pvalue = as.numeric(pval),
-					p.adjust = p.adjust(pvalue, method = p_adjust_method),
-					qvalue = p.adjust,
-					Count = as.integer(size),
-					GeneRatio = NA_character_,
-					BgRatio = NA_character_,
-					geneID = purrr::map_chr(leadingEdge, ~ paste(.x, collapse = "/")),
-					direction = "ranked"
-			) %>%
-			filter(p.adjust <= qvalue_cutoff | is.na(qvalue_cutoff)) %>%
-			arrange(p.adjust)
+        OrgDb = "org.Hs.eg.db",
+        ontology = "BP",
+        p_adjust_method = "BH",
+        qvalue_cutoff = 0.25,
+        min_gene_set_size = 10,
+        max_gene_set_size = 500,
+        fgsea_nproc = 1L,
+        go_pathways = NULL,
+        go_descriptions = NULL) {
+        # fgsea is the primary ranked enrichment method for gene/protein views.
+        require_namespace("fgsea", "ranked GO enrichment")
+
+        # Validate the requested within-fgsea CPU count.
+        fgsea_nproc <- normalize_n_cores(fgsea_nproc)
+
+        # Convert feature-level signed loadings to one ranked score per Entrez gene.
+        stats <- collapse_ranked_gene_scores(mapped_loadings)
+        # fgsea cannot test gene sets larger than the available ranked universe.
+        # If the ranked vector is smaller than the requested minimum gene-set size,
+        # no pathway can satisfy the size filter.
+        if (length(stats) < min_gene_set_size) return(tibble())
+
+        # Build GO gene sets once in the master session when not supplied.
+        if (is.null(go_pathways)) {
+                go_pathways <- build_go_pathways_for_fgsea(OrgDb = OrgDb, ontology = ontology)
+        }
+        go_pathways <- purrr::map(go_pathways, ~ intersect(.x, names(stats)))
+        go_pathways <- go_pathways[lengths(go_pathways) >= min_gene_set_size & lengths(go_pathways) <= max_gene_set_size]
+        if (length(go_pathways) == 0) return(tibble())
+
+        # Reuse GO term descriptions when they were precomputed outside the worker.
+        if (is.null(go_descriptions)) {
+                go_descriptions <- lookup_go_descriptions(names(go_pathways))
+        } else {
+                go_descriptions <- go_descriptions[names(go_pathways)]
+                missing_ids <- setdiff(names(go_pathways), names(go_descriptions))
+                if (length(missing_ids) > 0) {
+                        go_descriptions <- c(go_descriptions, setNames(missing_ids, missing_ids))
+                }
+        }
+
+        # Run preranked enrichment using signed MOFA loadings.
+        fg <- tryCatch({
+                fgsea::fgsea(
+                        pathways = go_pathways,
+                        stats = stats,
+                        minSize = min_gene_set_size,
+                        maxSize = max_gene_set_size,
+                        nproc = fgsea_nproc
+                )
+        }, error = function(e) NULL)
+
+        if (is.null(fg) || nrow(fg) == 0) return(tibble())
+
+        fg <- as_tibble(fg)
+
+        fg %>%
+                mutate(
+                        database = paste0("GO_", ontology, "_fgsea"),
+                        ID = as.character(pathway),
+                        Description = unname(go_descriptions[ID]),
+                        pvalue = as.numeric(pval),
+                        p.adjust = p.adjust(pvalue, method = p_adjust_method),
+                        qvalue = p.adjust,
+                        Count = as.integer(size),
+                        GeneRatio = NA_character_,
+                        BgRatio = NA_character_,
+                        geneID = purrr::map_chr(leadingEdge, ~ paste(.x, collapse = "/")),
+                        direction = "ranked"
+                ) %>%
+                filter(p.adjust <= qvalue_cutoff | is.na(qvalue_cutoff)) %>%
+                arrange(p.adjust)
 }
 
 #' Run ranked gene-set enrichment for a mapped MOFA view.
@@ -791,24 +869,30 @@ run_fgsea_go_enrichment <- function(mapped_loadings,
 #' @param mapped_loadings Tibble containing feature IDs, Entrez IDs, and loadings.
 #' @param OrgDb Character string naming the organism annotation package.
 #' @param ontology GO ontology to test.
-#' @param qvalue_cutoff Adjusted p-value threshold for reported fgsea results.
+#' @param qvalue_cutoff Adjusted p-value cutoff for reported fgsea results.
 #' @param fgsea_nproc Number of CPUs passed to `fgsea::fgsea()`.
+#' @param go_pathways Optional precomputed GO pathway list to reuse across workers.
+#' @param go_descriptions Optional precomputed GO descriptions to reuse across workers.
 #'
 #' @return Tibble of ranked GO enrichment results.
 run_gene_fgsea_bundle <- function(mapped_loadings,
-		OrgDb = "org.Hs.eg.db",
-		ontology = "BP",
-		qvalue_cutoff = 0.25,
-		fgsea_nproc = 1L) {
-	# Keep this wrapper separate so additional ranked gene-set collections can be
-	# added later without changing the enrichment dispatcher.
-	run_fgsea_go_enrichment(
-			mapped_loadings = mapped_loadings,
-			OrgDb = OrgDb,
-			ontology = ontology,
-			qvalue_cutoff = qvalue_cutoff,
-			fgsea_nproc = fgsea_nproc
-	)
+        OrgDb = "org.Hs.eg.db",
+        ontology = "BP",
+        qvalue_cutoff = 0.25,
+        fgsea_nproc = 1L,
+        go_pathways = NULL,
+        go_descriptions = NULL) {
+        # Keep this wrapper separate so additional ranked gene-set collections can be
+        # added later without changing the enrichment dispatcher.
+        run_fgsea_go_enrichment(
+                mapped_loadings = mapped_loadings,
+                OrgDb = OrgDb,
+                ontology = ontology,
+                qvalue_cutoff = qvalue_cutoff,
+                fgsea_nproc = fgsea_nproc,
+                go_pathways = go_pathways,
+                go_descriptions = go_descriptions
+        )
 }
 
 
@@ -1264,9 +1348,10 @@ make_top_feature_table <- function(loadings,
 #' Iterates over each factor and omics view and dispatches to the appropriate
 #' enrichment method. Expression, proteomics, and methylation are analyzed with
 #' ranked GO enrichment using `fgsea` and the full signed loading vector after
-#' mapping features to Entrez genes. Each of these views is tested once per
-#' factor/view combination; the sign of the `fgsea` NES determines whether a
-#' term is associated with positive or negative factor loadings. Metabolomics
+#' mapping features to Entrez genes. For each factor/view combination, one fgsea
+#' run is performed for each requested GO ontology. The sign of the `fgsea` NES
+#' determines whether a term is associated with positive or negative factor
+#' loadings. Metabolomics
 #' retains top-feature over-representation against Metabolon annotation categories.
 #'
 #' @param loadings Tibble of all MOFA loadings.
@@ -1277,7 +1362,10 @@ make_top_feature_table <- function(loadings,
 #' @param expression_id_type Expression ID type: `"auto"`, `"ENTREZID"`, or `"SYMBOL"`.
 #' @param OrgDb Character string naming the organism annotation package.
 #' @param organism Organism name retained for compatibility with previous ORA code.
-#' @param go_ontology GO ontology for ranked expression, proteomics, and methylation enrichment.
+#' @param go_ontology Character vector containing one or more GO ontologies for
+#'   ranked expression, proteomics, and methylation enrichment. Supported values
+#'   are `"BP"`, `"MF"`, and `"CC"`. Each requested ontology is analyzed
+#'   separately so multiple-testing adjustment remains ontology-specific.
 #' @param methylation_array_type Illumina methylation array type.
 #' @param methylation_collection Retained for compatibility with older ORA-based methylation
 #'   enrichment code; ranked methylation enrichment uses `go_ontology`.
@@ -1288,176 +1376,254 @@ make_top_feature_table <- function(loadings,
 #' @param metabolon_term_cols Metabolon columns used as categorical terms.
 #' @param n_cores Number of task-level parallel workers. Each task is one
 #'   factor/view/direction job for metabolomics or one factor/view ranked job
-#'   for expression, proteomics, or methylation.
+#'   for expression, proteomics, or methylation. When multiple GO ontologies are
+#'   requested, their fgsea runs are performed within the corresponding ranked task.
 #' @param fgsea_nproc Number of CPUs passed to `fgsea::fgsea()` inside each
 #'   gene/protein/methylation fgsea task. Use `1` when `n_cores > 1` to avoid CPU oversubscription.
 #'
 #' @return Tibble of enrichment results from all available views.
 run_all_enrichments <- function(loadings,
-		selected_features,
-		metabolon_annotation = NULL,
-		metabolomics_feature_col = "BIOCHEMICAL",
-		expression_id_type = c("auto", "ENTREZID", "SYMBOL"),
-		OrgDb = "org.Hs.eg.db",
-		organism = "human",
-		go_ontology = "BP",
-		methylation_array_type = c("EPIC", "450K"),
-		methylation_collection = "GO",
-		methylation_entrez_mapping = NULL,
-		qvalue_cutoff = 0.25,
-		metabolon_term_cols = c("SUPER_PATHWAY", "SUB_PATHWAY", "PARENT_CLASSIFICATION", "CLASSIFICATION"),
-		n_cores = 1L,
-		fgsea_nproc = 1L) {
-	# Dispatch enrichment analyses according to the omics view being processed.
-	expression_id_type <- match.arg(expression_id_type)
-	methylation_array_type <- match.arg(methylation_array_type)
-	
-	# Normalize parallelization parameters before dispatching tasks.
-	n_cores <- normalize_n_cores(n_cores)
-	fgsea_nproc <- normalize_n_cores(fgsea_nproc)
-	
-	# Prepare methylation CpG-to-Entrez mapping before task-level parallelization.
-	# This avoids calling missMethyl annotation helpers from independent worker R
-	# sessions, which can behave inconsistently across parallel workers.
-	if (is.null(methylation_entrez_mapping) && any(loadings$view == "methylation")) {
-		methylation_entrez_mapping <- prepare_methylation_entrez_mapping(
-				all_cpgs = loadings %>% filter(view == "methylation") %>% pull(feature),
-				array_type = methylation_array_type
-		)
-	}
-	
-	# Ensure that workers always receive a plain tibble with the expected columns.
-	if (is.null(methylation_entrez_mapping)) {
-		methylation_entrez_mapping <- tibble(feature = character(), ENTREZID = character())
-	} else {
-		methylation_entrez_mapping <- methylation_entrez_mapping %>%
-				as_tibble() %>%
-				transmute(feature = as.character(feature), ENTREZID = as.character(ENTREZID)) %>%
-				filter(!is.na(feature), !is.na(ENTREZID)) %>%
-				distinct(feature, ENTREZID)
-	}
-	
-	# Ranked gene/protein/methylation analyses use the full signed loading vector
-	# exactly once per factor and view. fgsea then assigns positive or negative
-	# direction from the sign of the NES, rather than from separate input subsets.
-	ranked_tasks <- loadings %>%
-			filter(view %in% c("proteomics", "expression", "methylation")) %>%
-			distinct(view, factor) %>%
-			mutate(direction = "ranked")
-	
-	# Metabolomics still uses selected top-loading features and therefore retains
-	# explicit positive/negative selected-feature groups because it is analyzed by
-	# ORA rather than ranked enrichment.
-	selected_tasks <- selected_features %>%
-			filter(!view %in% c("proteomics", "expression", "methylation")) %>%
-			distinct(view, factor, direction)
-	
-	tasks <- bind_rows(ranked_tasks, selected_tasks) %>%
-			arrange(factor, view, direction)
-	
-	if (nrow(tasks) == 0) return(tibble())
-	
-	# Process independent enrichment jobs in parallel when n_cores > 1.
-	parallel_map_dfr(seq_len(nrow(tasks)), function(i) {
-				task <- tasks[i, ]
-				view_i <- task$view
-				factor_i <- task$factor
-				direction_i <- task$direction
-				
-				selected_i <- selected_features %>%
-						filter(view == view_i, factor == factor_i, direction == direction_i)
-				
-				background_i <- loadings %>%
-						filter(view == view_i, factor == factor_i)
-				
-				result <- tryCatch({
-							if (view_i == "proteomics") {
-								# Map every protein loading in this factor to Entrez IDs, then run fgsea.
-								mapped_loadings <- map_uniprot_to_entrez(background_i$feature, OrgDb = OrgDb) %>%
-										left_join(background_i, by = "feature")
-								
-								run_gene_fgsea_bundle(
-										mapped_loadings = mapped_loadings,
-										OrgDb = OrgDb,
-										ontology = go_ontology,
-										qvalue_cutoff = qvalue_cutoff,
-										fgsea_nproc = fgsea_nproc
-								)
-							} else if (view_i == "expression") {
-								# Map every expression loading in this factor to Entrez IDs, then run fgsea.
-								mapped_loadings <- map_expression_to_entrez(background_i$feature, expression_id_type = expression_id_type, OrgDb = OrgDb) %>%
-										left_join(background_i, by = "feature")
-								
-								run_gene_fgsea_bundle(
-										mapped_loadings = mapped_loadings,
-										OrgDb = OrgDb,
-										ontology = go_ontology,
-										qvalue_cutoff = qvalue_cutoff,
-										fgsea_nproc = fgsea_nproc
-								)
-							} else if (view_i == "methylation") {
-								# Join this factor's CpG loadings to the CpG-to-Entrez mapping that
-								# was prepared once before parallel workers were launched.
-								mapped_loadings <- map_methylation_loadings_with_precomputed_mapping(
-										cpg_loadings = background_i,
-										methylation_entrez_mapping = methylation_entrez_mapping
-								)
-								
-								run_gene_fgsea_bundle(
-										mapped_loadings = mapped_loadings,
-										OrgDb = OrgDb,
-										ontology = go_ontology,
-										qvalue_cutoff = qvalue_cutoff,
-										fgsea_nproc = fgsea_nproc
-								)
-							} else if (view_i == "metabolomics") {
-								# Metabolomics enrichment remains categorical over-representation against Metabolon terms.
-								if (is.null(metabolon_annotation)) return(tibble())
-								ann <- clean_metabolon_annotation(metabolon_annotation)
-								
-								run_categorical_enrichment(
-										selected_features = selected_i$feature,
-										background_features = background_i$feature,
-										annotation = ann,
-										feature_col = metabolomics_feature_col,
-										term_cols = metabolon_term_cols
-								)
-							} else {
-								tibble()
-							}
-						}, error = function(e) {
-							tibble(
-									database = paste0("ERROR_", view_i),
-									ID = NA_character_,
-									Description = conditionMessage(e),
-									pvalue = NA_real_,
-									p.adjust = NA_real_,
-									qvalue = NA_real_,
-									Count = NA_integer_,
-									GeneRatio = NA_character_
-							)
-						})
-				
-				if (nrow(result) == 0) return(tibble())
-				
-				# fgsea results are labeled as "ranked" because they come from one full
-				# signed loading vector. ORA results inherit the selected-feature direction
-				# from the task table.
-				if (!"direction" %in% names(result)) {
-					result <- result %>% mutate(direction = direction_i)
-				}
-				
-				result %>%
-						mutate(
-								factor = factor_i,
-								view = view_i,
-								.before = 1
-						) %>%
-						relocate(factor, view, direction)
-			}, n_cores = n_cores)
+        selected_features,
+        metabolon_annotation = NULL,
+        metabolomics_feature_col = "BIOCHEMICAL",
+        expression_id_type = c("auto", "ENTREZID", "SYMBOL"),
+        OrgDb = "org.Hs.eg.db",
+        organism = "human",
+        go_ontology = "BP",
+        methylation_array_type = c("EPIC", "450K"),
+        methylation_collection = "GO",
+        methylation_entrez_mapping = NULL,
+        qvalue_cutoff = 0.25,
+        metabolon_term_cols = c("SUPER_PATHWAY", "SUB_PATHWAY", "PARENT_CLASSIFICATION", "CLASSIFICATION"),
+        n_cores = 1L,
+        fgsea_nproc = 1L) {
+        # Dispatch enrichment analyses according to the omics view being processed.
+        expression_id_type <- match.arg(expression_id_type)
+        methylation_array_type <- match.arg(methylation_array_type)
+        go_ontology <- validate_go_ontologies(go_ontology)
+
+        # Normalize parallelization parameters before dispatching tasks.
+        n_cores <- normalize_n_cores(n_cores)
+        fgsea_nproc <- normalize_n_cores(fgsea_nproc)
+
+        # Precompute all annotation-derived mapping tables and GO resources once in
+        # the main process so workers only need plain tibbles/lists.
+        proteomics_entrez_mapping <- tibble(feature = character(), ENTREZID = character(), SYMBOL = character())
+        if (any(loadings$view == "proteomics")) {
+                proteomics_entrez_mapping <- map_uniprot_to_entrez(
+                        uniprot_ids = loadings %>% filter(view == "proteomics") %>% pull(feature),
+                        OrgDb = OrgDb
+                ) %>%
+                        as_tibble() %>%
+                        transmute(
+                                feature = as.character(feature),
+                                ENTREZID = as.character(ENTREZID),
+                                SYMBOL = as.character(SYMBOL)
+                        ) %>%
+                        filter(!is.na(feature), !is.na(ENTREZID)) %>%
+                        distinct(feature, ENTREZID, SYMBOL)
+        }
+
+        expression_entrez_mapping <- tibble(feature = character(), ENTREZID = character(), SYMBOL = character())
+        if (any(loadings$view == "expression")) {
+                expression_entrez_mapping <- map_expression_to_entrez(
+                        expression_ids = loadings %>% filter(view == "expression") %>% pull(feature),
+                        expression_id_type = expression_id_type,
+                        OrgDb = OrgDb
+                ) %>%
+                        as_tibble() %>%
+                        transmute(
+                                feature = as.character(feature),
+                                ENTREZID = as.character(ENTREZID),
+                                SYMBOL = as.character(SYMBOL)
+                        ) %>%
+                        filter(!is.na(feature), !is.na(ENTREZID)) %>%
+                        distinct(feature, ENTREZID, SYMBOL)
+        }
+
+        # Prepare methylation CpG-to-Entrez mapping before task-level parallelization.
+        # This avoids calling missMethyl annotation helpers from independent worker R
+        # sessions, which can behave inconsistently across parallel workers.
+        if (is.null(methylation_entrez_mapping) && any(loadings$view == "methylation")) {
+                methylation_entrez_mapping <- prepare_methylation_entrez_mapping(
+                        all_cpgs = loadings %>% filter(view == "methylation") %>% pull(feature),
+                        array_type = methylation_array_type
+                )
+        }
+
+        # Ensure that workers always receive plain tibbles with the expected columns.
+        if (is.null(methylation_entrez_mapping)) {
+                methylation_entrez_mapping <- tibble(feature = character(), ENTREZID = character())
+        } else {
+                methylation_entrez_mapping <- methylation_entrez_mapping %>%
+                        as_tibble() %>%
+                        transmute(feature = as.character(feature), ENTREZID = as.character(ENTREZID)) %>%
+                        filter(!is.na(feature), !is.na(ENTREZID)) %>%
+                        distinct(feature, ENTREZID)
+        }
+
+        # Precompute GO gene sets and descriptions separately for every requested
+        # ontology. Keeping BP, MF, and CC in separate fgsea runs preserves
+        # ontology-specific multiple-testing adjustment.
+        go_pathways <- setNames(vector("list", length(go_ontology)), go_ontology)
+        go_descriptions <- setNames(vector("list", length(go_ontology)), go_ontology)
+        if (any(loadings$view %in% c("proteomics", "expression", "methylation"))) {
+                for (ontology_i in go_ontology) {
+                        go_pathways[[ontology_i]] <- build_go_pathways_for_fgsea(
+                                OrgDb = OrgDb, ontology = ontology_i
+                        )
+                        go_descriptions[[ontology_i]] <- lookup_go_descriptions(
+                                names(go_pathways[[ontology_i]])
+                        )
+                }
+        }
+
+        # Ranked gene/protein/methylation analyses use the full signed loading vector
+        # once per requested ontology for each factor and view. fgsea then assigns
+        # positive or negative direction from the sign of the NES, rather than from
+        # separate input subsets.
+        ranked_tasks <- loadings %>%
+                filter(view %in% c("proteomics", "expression", "methylation")) %>%
+                distinct(view, factor) %>%
+                mutate(direction = "ranked")
+
+        # Metabolomics still uses selected top-loading features and therefore retains
+        # explicit positive/negative selected-feature groups because it is analyzed by
+        # ORA rather than ranked enrichment.
+        selected_tasks <- selected_features %>%
+                filter(!view %in% c("proteomics", "expression", "methylation")) %>%
+                distinct(view, factor, direction)
+
+        tasks <- bind_rows(ranked_tasks, selected_tasks) %>%
+                arrange(factor, view, direction)
+
+        if (nrow(tasks) == 0) return(tibble())
+
+        # Process independent enrichment jobs in parallel when n_cores > 1.
+        parallel_map_dfr(seq_len(nrow(tasks)), function(i) {
+                task <- tasks[i, ]
+                view_i <- task$view
+                factor_i <- task$factor
+                direction_i <- task$direction
+
+                selected_i <- selected_features %>%
+                        filter(view == view_i, factor == factor_i, direction == direction_i)
+
+                background_i <- loadings %>%
+                        filter(view == view_i, factor == factor_i)
+
+                result <- tryCatch({
+                        if (view_i == "proteomics") {
+                                # Join this factor's protein loadings to the precomputed
+                                # protein-to-Entrez mapping created in the main process.
+                                mapped_loadings <- proteomics_entrez_mapping %>%
+                                        inner_join(background_i, by = "feature")
+
+                                # Run fgsea independently for each requested GO ontology so
+                                # adjusted p-values are calculated within BP, MF, or CC rather
+                                # than across a pooled collection of heterogeneous GO terms.
+                                purrr::map_dfr(go_ontology, function(ontology_i) {
+                                        run_gene_fgsea_bundle(
+                                                mapped_loadings = mapped_loadings,
+                                                OrgDb = OrgDb,
+                                                ontology = ontology_i,
+                                                qvalue_cutoff = qvalue_cutoff,
+                                                fgsea_nproc = fgsea_nproc,
+                                                go_pathways = go_pathways[[ontology_i]],
+                                                go_descriptions = go_descriptions[[ontology_i]]
+                                        )
+                                })
+                        } else if (view_i == "expression") {
+                                # Join this factor's expression loadings to the precomputed
+                                # expression-to-Entrez mapping created in the main process.
+                                mapped_loadings <- expression_entrez_mapping %>%
+                                        inner_join(background_i, by = "feature")
+
+                                # Run fgsea independently for each requested GO ontology so
+                                # adjusted p-values are calculated within BP, MF, or CC rather
+                                # than across a pooled collection of heterogeneous GO terms.
+                                purrr::map_dfr(go_ontology, function(ontology_i) {
+                                        run_gene_fgsea_bundle(
+                                                mapped_loadings = mapped_loadings,
+                                                OrgDb = OrgDb,
+                                                ontology = ontology_i,
+                                                qvalue_cutoff = qvalue_cutoff,
+                                                fgsea_nproc = fgsea_nproc,
+                                                go_pathways = go_pathways[[ontology_i]],
+                                                go_descriptions = go_descriptions[[ontology_i]]
+                                        )
+                                })
+                        } else if (view_i == "methylation") {
+                                # Join this factor's CpG loadings to the CpG-to-Entrez mapping that
+                                # was prepared once before parallel workers were launched.
+                                mapped_loadings <- map_methylation_loadings_with_precomputed_mapping(
+                                        cpg_loadings = background_i,
+                                        methylation_entrez_mapping = methylation_entrez_mapping
+                                )
+
+                                # Run fgsea independently for each requested GO ontology so
+                                # adjusted p-values are calculated within BP, MF, or CC rather
+                                # than across a pooled collection of heterogeneous GO terms.
+                                purrr::map_dfr(go_ontology, function(ontology_i) {
+                                        run_gene_fgsea_bundle(
+                                                mapped_loadings = mapped_loadings,
+                                                OrgDb = OrgDb,
+                                                ontology = ontology_i,
+                                                qvalue_cutoff = qvalue_cutoff,
+                                                fgsea_nproc = fgsea_nproc,
+                                                go_pathways = go_pathways[[ontology_i]],
+                                                go_descriptions = go_descriptions[[ontology_i]]
+                                        )
+                                })
+                        } else if (view_i == "metabolomics") {
+                                # Metabolomics enrichment remains categorical over-representation against Metabolon terms.
+                                if (is.null(metabolon_annotation)) return(tibble())
+                                ann <- clean_metabolon_annotation(metabolon_annotation)
+
+                                run_categorical_enrichment(
+                                        selected_features = selected_i$feature,
+                                        background_features = background_i$feature,
+                                        annotation = ann,
+                                        feature_col = metabolomics_feature_col,
+                                        term_cols = metabolon_term_cols
+                                )
+                        } else {
+                                tibble()
+                        }
+                }, error = function(e) {
+                        tibble(
+                                database = paste0("ERROR_", view_i),
+                                ID = NA_character_,
+                                Description = conditionMessage(e),
+                                pvalue = NA_real_,
+                                p.adjust = NA_real_,
+                                qvalue = NA_real_,
+                                Count = NA_integer_,
+                                GeneRatio = NA_character_
+                        )
+                })
+
+                if (nrow(result) == 0) return(tibble())
+
+                # fgsea results are labeled as "ranked" because they come from one full
+                # signed loading vector. ORA results inherit the selected-feature direction
+                # from the task table.
+                if (!"direction" %in% names(result)) {
+                        result <- result %>% mutate(direction = direction_i)
+                }
+
+                result %>%
+                        mutate(
+                                factor = factor_i,
+                                view = view_i,
+                                .before = 1
+                        ) %>%
+                        relocate(factor, view, direction)
+        }, n_cores = n_cores)
 }
 
 # -----------------------------------------------------------------------------
+# Cautious biological interpretation text# -----------------------------------------------------------------------------
 # Cautious biological interpretation text
 # -----------------------------------------------------------------------------
 
@@ -1478,8 +1644,8 @@ summarise_factor_interpretation <- function(enrichment_results,
 		max_terms_per_view = 3) {
 	# Convert enriched terms into conservative prose for the report.
 	er <- enrichment_results %>%
-			filter(factor == factor_id, !is.na(p.adjust), !is.na(qvalue)) %>%
-			filter(p.adjust < fdr_cutoff, qvalue < fdr_cutoff) %>%
+			filter(factor == factor_id, !is.na(p.adjust)) %>%
+			filter(p.adjust < fdr_cutoff) %>%
 			group_by(view, direction) %>%
 			arrange(p.adjust, .by_group = TRUE) %>%
 			slice_head(n = max_terms_per_view) %>%
@@ -1490,7 +1656,10 @@ summarise_factor_interpretation <- function(enrichment_results,
 	}
 	
 	pieces <- er %>%
-			mutate(term_label = paste0(Description, " [", database, ", adj.P=", signif(p.adjust, 3), ", q=", signif(qvalue, 3), "]")) %>%
+			mutate(term_label = paste0(
+					Description, " [", database,
+					", adj.P=", sprintf("%.4e", p.adjust), "]"
+			)) %>%
 			group_by(view, direction) %>%
 			summarise(terms = paste(term_label, collapse = "; "), .groups = "drop") %>%
 			mutate(sentence = ifelse(
@@ -1593,7 +1762,34 @@ draw_wrapped_text <- function(text,
 	y
 }
 
-#' Convert a data frame to a compact monospaced text table.
+#' Format probabilities for compact report display.
+#'
+#' @param x Numeric vector of probabilities.
+#'
+#' @return Character vector in scientific notation with five significant digits.
+format_report_probability <- function(x) {
+	# Preserve zero-length inputs. This is important when the formatter is used
+	# inside dplyr pipelines that may operate on an empty enrichment subset.
+	if (length(x) == 0L) return(character(0))
+
+	# Convert once to numeric, then format the complete vector. Using vectorized
+	# indexing avoids scalar `if` logic and therefore handles vectors of any
+	# length safely, including missing values. Four digits after the decimal
+	# point give five significant digits in the scientific-notation coefficient.
+	x_num <- as.numeric(x)
+	out <- rep("", length(x_num))
+	keep <- !is.na(x_num)
+	if (any(keep)) {
+		out[keep] <- formatC(x_num[keep], format = "e", digits = 4)
+	}
+	out
+}
+
+#' Convert a data frame to a wrapped, fixed-width monospaced text table.
+#'
+#' Long cell contents are wrapped within their assigned column widths rather
+#' than truncated. Each logical data row may therefore occupy multiple printed
+#' lines, while the total table width remains bounded for landscape PDF output.
 #'
 #' @param df Data frame to format.
 #' @param max_rows Maximum number of rows to print.
@@ -1601,58 +1797,82 @@ draw_wrapped_text <- function(text,
 #' @param col_widths Optional named numeric vector giving per-column character
 #'   widths. Values in `col_widths` override `max_col_width` for matching columns.
 #'
-#' @return Character vector representing the table.
-format_pdf_table <- function(df, max_rows = 25, max_col_width = 28, col_widths = NULL) {
-	# Convert tabular results into fixed-width text for PDF display.
+#' @return A list containing the formatted header and one character vector per
+#'   logical data row.
+format_pdf_table <- function(df, max_rows = 25, max_col_width = 14, col_widths = NULL) {
 	# Return a clear placeholder if the input table is empty.
-	if (is.null(df) || nrow(df) == 0) return("No rows to display.")
-	
-	# Keep each rendered table chunk small enough to fit on the page.
-	df <- as.data.frame(head(df, max_rows), stringsAsFactors = FALSE)
-	
-	# Convert values to character and truncate long entries. Named column-specific
-	# widths allow important fields, such as gene-set descriptions, to be wider.
-	for (col_name in names(df)) {
-		this_width <- max_col_width
-		if (!is.null(col_widths) && col_name %in% names(col_widths)) {
-			this_width <- as.integer(col_widths[[col_name]])
-		}
-		this_width <- max(4L, this_width)
-		col <- as.character(df[[col_name]])
-		col[is.na(col)] <- ""
-		df[[col_name]] <- ifelse(
-				nchar(col) > this_width,
-				paste0(substr(col, 1, this_width - 3), "..."),
-				col
-		)
+	if (is.null(df) || nrow(df) == 0) {
+		return(list(header = "No rows to display.", rows = list()))
 	}
 	
-	# Capture the base R data-frame printout for drawing with graphics::text().
-	capture.output(print(df, row.names = FALSE, right = FALSE))
+	# Keep only the requested number of logical rows.
+	df <- as.data.frame(head(df, max_rows), stringsAsFactors = FALSE)
+	
+	# Determine fixed character widths for all columns. Keeping the sum of these
+	# widths bounded is what makes the table use the landscape page without
+	# running past its right edge.
+	widths <- rep(as.integer(max_col_width), ncol(df))
+	names(widths) <- names(df)
+	if (!is.null(col_widths)) {
+		matched <- intersect(names(col_widths), names(widths))
+		widths[matched] <- as.integer(col_widths[matched])
+	}
+	widths <- pmax(widths, nchar(names(df)), 4L)
+	
+	pad_cell <- function(x, width) {
+		x <- ifelse(is.na(x), "", as.character(x))
+		x <- substr(x, 1L, width)
+		paste0(x, strrep(" ", max(0L, width - nchar(x))))
+	}
+	
+	wrap_cell <- function(x, width) {
+		x <- ifelse(is.na(x), "", as.character(x))
+		if (!nzchar(x)) return("")
+		wrapped <- strwrap(x, width = width, simplify = FALSE)[[1]]
+		if (length(wrapped) == 0) "" else wrapped
+	}
+	
+	# Build a compact two-line header.
+	header <- paste(mapply(pad_cell, names(df), widths, USE.NAMES = FALSE), collapse = " ")
+	separator <- paste(vapply(widths, function(w) strrep("-", w), character(1)), collapse = " ")
+	
+	# Format each logical row independently so wrapped cells stay aligned.
+	rows <- lapply(seq_len(nrow(df)), function(i) {
+		cells <- Map(wrap_cell, df[i, , drop = FALSE], widths)
+		n_lines <- max(vapply(cells, length, integer(1)))
+		vapply(seq_len(n_lines), function(j) {
+			parts <- mapply(function(cell, width) {
+				value <- if (j <= length(cell)) cell[[j]] else ""
+				pad_cell(value, width)
+			}, cells, widths, USE.NAMES = FALSE)
+			paste(parts, collapse = " ")
+		}, character(1))
+	})
+	
+	list(header = c(header, separator), rows = rows)
 }
 
 #' Draw a data frame across one or more PDF pages.
 #'
-#' This table renderer intentionally uses base R graphics only. The result is
-#' less polished than a LaTeX/rmarkdown table, but it is portable and avoids
-#' external document-conversion dependencies.
+#' This base-R renderer wraps long table cells and paginates according to the
+#' number of physical text lines required, rather than assuming that every
+#' logical result row occupies one line.
 #'
 #' @param df Data frame to draw.
 #' @param title Page title.
 #' @param subtitle Optional page subtitle.
-#' @param max_rows_per_page Maximum number of data rows per page.
+#' @param max_rows_per_page Maximum number of logical rows considered per page.
 #' @param max_col_width Default maximum number of characters per table cell.
 #' @param col_widths Optional named numeric vector giving per-column character
-#'   widths. Use this to widen specific columns in report tables.
+#'   widths. Use this to allocate landscape-page width among columns.
 #'
 #' @return Invisibly returns NULL.
 draw_table_pages <- function(df,
 		title,
 		subtitle = NULL,
 		max_rows_per_page = 25,
-		max_col_width = 28,
+		max_col_width = 14,
 		col_widths = NULL) {
-	# Paginate large tables across multiple PDF pages.
 	# Draw a one-page placeholder for empty tables.
 	if (is.null(df) || nrow(df) == 0) {
 		new_pdf_page(title = title, subtitle = subtitle)
@@ -1660,32 +1880,51 @@ draw_table_pages <- function(df,
 		return(invisible(NULL))
 	}
 	
-	# Split rows into page-sized chunks.
-	page_ids <- ceiling(seq_len(nrow(df)) / max_rows_per_page)
-	chunks <- split(df, page_ids)
+	# Format all logical rows first. A row can occupy multiple physical lines.
+	formatted <- format_pdf_table(
+			df,
+			max_rows = nrow(df),
+			max_col_width = max_col_width,
+			col_widths = col_widths
+	)
 	
-	# Render each chunk on a separate PDF page.
-	for (i in seq_along(chunks)) {
-		page_suffix <- if (length(chunks) > 1) {
-					paste0(" page ", i, " of ", length(chunks))
-				} else {
-					NULL
-				}
-		
+	# Pack complete logical rows onto pages. This avoids both clipping at the
+	# bottom and the very sparse one-row-per-page behavior caused by long geneID
+	# fields in the previous renderer.
+	max_body_lines <- 31L
+	pages <- list()
+	current <- list()
+	current_lines <- 0L
+	for (row_lines in formatted$rows) {
+		row_n <- length(row_lines)
+		if (length(current) >= max_rows_per_page ||
+				(current_lines > 0L && current_lines + row_n > max_body_lines)) {
+			pages[[length(pages) + 1L]] <- current
+			current <- list()
+			current_lines <- 0L
+		}
+		current[[length(current) + 1L]] <- row_lines
+		current_lines <- current_lines + row_n
+	}
+	if (length(current) > 0L) pages[[length(pages) + 1L]] <- current
+	
+	for (i in seq_along(pages)) {
+		page_suffix <- if (length(pages) > 1) paste0(" page ", i, " of ", length(pages)) else NULL
 		new_pdf_page(title = title, subtitle = paste(c(subtitle, page_suffix), collapse = ""))
 		
-		table_lines <- format_pdf_table(
-				chunks[[i]],
-				max_rows = max_rows_per_page,
-				max_col_width = max_col_width,
-				col_widths = col_widths
-		)
-		
-		# Draw the table in a monospaced font so columns remain aligned.
+		# Use a smaller monospaced font so the complete fixed-width table occupies
+		# the available landscape width while retaining readable column alignment.
 		y <- 0.88
-		for (line in table_lines) {
-			graphics::text(0.04, y, line, adj = c(0, 1), cex = 0.53, family = "mono")
-			y <- y - 0.026
+		for (line in formatted$header) {
+			graphics::text(0.025, y, line, adj = c(0, 1), cex = 0.43, family = "mono")
+			y <- y - 0.023
+		}
+		for (row_lines in pages[[i]]) {
+			for (line in row_lines) {
+				graphics::text(0.025, y, line, adj = c(0, 1), cex = 0.43, family = "mono")
+				y <- y - 0.023
+			}
+			y <- y - 0.004
 		}
 	}
 	
@@ -1700,7 +1939,7 @@ draw_table_pages <- function(df,
 #' @param results List returned by run_mofa_integrative_interpretation().
 #' @param output_dir Directory where the PDF should be written.
 #' @param output_file Name of the PDF file.
-#' @param report_significance_cutoff Significance threshold used for report prose and for filtering enrichment rows shown in the PDF report. Rows are shown only when both `p.adjust` and `qvalue` are below this threshold.
+#' @param report_significance_cutoff Significance threshold used for report prose and for filtering enrichment rows shown in the PDF report. Rows are shown only when `p.adjust` is below this threshold.
 #' @param top_enrichment_rows Number of enrichment rows to print per group.
 #' @param include_top_features Logical. If `TRUE`, include factor-specific top
 #'   loaded feature tables in the PDF report.
@@ -1760,7 +1999,7 @@ render_mofa_pdf_report_base <- function(results,
 	draw_table_pages(overview_features, title = "Overview: features by view", max_rows_per_page = 35)
 	
 	# Omit the selected-feature overview table from the PDF report.
-	# The selected features are still written to selected_factor_features.csv.
+	# The selected features are still written to selected_factor_features.xlsx.
 	
 	# Overview: variance explained, if MOFA2 provided it successfully.
 	if (!is.null(variance_explained) && nrow(variance_explained) > 0) {
@@ -1804,26 +2043,39 @@ render_mofa_pdf_report_base <- function(results,
 		
 		# Factor-specific enrichment results. Only terms significant by both adjusted
 		# p-value and q-value are included in the PDF report. The full, unfiltered
-		# enrichment table remains available in enrichment_results.csv.
+		# enrichment table remains available in enrichment_results.xlsx.
 		er <- enrichment_results %>%
 				filter(factor == fac) %>%
-				filter(!is.na(p.adjust), !is.na(qvalue)) %>%
-				filter(p.adjust < report_significance_cutoff, qvalue < report_significance_cutoff) %>%
+				filter(!is.na(p.adjust)) %>%
+				filter(p.adjust < report_significance_cutoff) %>%
+				# Order each factor-view-direction group by increasing adjusted p-value.
 				arrange(view, direction, p.adjust) %>%
+				# Keep the PDF table focused on interpretable enrichment statistics. The
+				# potentially very long geneID/leading-edge contents remain available in
+				# enrichment_results.xlsx but are intentionally omitted from the PDF.
 				select(any_of(c(
-										"view", "direction", "database", "ID", "Description", "GeneRatio",
-										"BgRatio", "Count", "pvalue", "p.adjust", "qvalue", "geneID"
+										"view", "direction", "database", "term", "Description", "GeneRatio",
+										"BgRatio", "Count", "pvalue", "p.adjust"
 								))) %>%
 				group_by(view, direction, database) %>%
 				slice_head(n = top_enrichment_rows) %>%
-				ungroup()
+				ungroup() %>%
+				# Re-establish the requested factor-view-direction significance order after
+				# grouped row selection, then format probabilities only for display.
+				arrange(view, direction, p.adjust) %>%
+				mutate(across(any_of(c("pvalue", "p.adjust")),
+								~ sprintf("%.4e", as.numeric(.x))))
 		
 		draw_table_pages(
 				er,
 				title = paste("Factor", fac, "enrichment results"),
 				max_rows_per_page = 20,
-				max_col_width = 16,
-				col_widths = c(Description = 55, database = 22, geneID = 26)
+				max_col_width = 10,
+				col_widths = c(
+						view = 12, direction = 9, database = 22, term = 14,
+						Description = 70, GeneRatio = 9, BgRatio = 9, Count = 5,
+						pvalue = 10, p.adjust = 10
+				)
 		)
 	}
 	
@@ -1914,11 +2166,13 @@ write_report_rmd <- function(report_rmd_path) {
 			"      cat('\n\n')",
 			"    }",
 			"  }",
-			"  er <- enrichment_results %>% filter(factor == fac) %>% filter(!is.na(p.adjust), !is.na(qvalue)) %>% filter(p.adjust < params$significance_cutoff, qvalue < params$significance_cutoff) %>% arrange(view, direction, p.adjust)",
+			"  er <- enrichment_results %>% filter(factor == fac) %>% filter(!is.na(p.adjust)) %>% filter(p.adjust < params$significance_cutoff) %>% arrange(view, direction, p.adjust)",
 			"  if (nrow(er) > 0) {",
 			"    cat('### Enrichment results\n\n')",
 			"    er2 <- er %>%",
-			"      select(any_of(c('view', 'direction', 'database', 'ID', 'Description', 'GeneRatio', 'BgRatio', 'Count', 'pvalue', 'p.adjust', 'qvalue', 'geneID'))) %>%",
+			"      arrange(view, direction, p.adjust) %>%",
+			"      mutate(across(any_of(c('pvalue', 'p.adjust')), ~ formatC(as.numeric(.x), format = 'e', digits = 4))) %>%",
+			"      select(any_of(c('view', 'direction', 'database', 'term', 'Description', 'GeneRatio', 'BgRatio', 'Count', 'pvalue', 'p.adjust', 'Leading edge/members'))) %>%",
 			"      group_by(view, direction, database) %>%",
 			"      slice_head(n = 10) %>%",
 			"      ungroup()",
@@ -1962,9 +2216,11 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 	# Create the output directory.
 	dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 	
-	# Save the analysis results for use by the R Markdown template.
-	results_rds <- file.path(output_dir, "mofa_integrative_results.rds")
+	# Save the full analysis results temporarily for use by the R Markdown
+	# template. The user-facing RDS written by the main wrapper is condensed.
+	results_rds <- file.path(output_dir, "mofa_integrative_results_report_tmp.rds")
 	saveRDS(results, results_rds)
+	on.exit(unlink(results_rds), add = TRUE)
 	
 	# Write the parameterized R Markdown template.
 	report_rmd <- file.path(output_dir, "mofa_integrative_report.Rmd")
@@ -2015,7 +2271,9 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 #' @param output_dir Character string giving the directory where result files
 #'   and the report should be written.
 #' @param views Character vector of MOFA view names to analyze. Unsupported view
-#'   names are ignored with a warning.
+#'   names are ignored with a warning. The execution block also accepts the
+#'   convenience value `"all"`, which is expanded to all views in the loaded
+#'   MOFA object before this function is called.
 #' @param factors Factors to extract from the MOFA object. Passed to
 #'   `MOFA2::get_weights()`; use `"all"` to analyze all factors.
 #' @param selection_mode Character string specifying how high-loading features
@@ -2040,20 +2298,22 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 #'   package used for gene/protein ID mapping, for example `"org.Hs.eg.db"`.
 #' @param organism Character string specifying the organism name used by
 #'   `ReactomePA::enrichPathway()`, for example `"human"`.
-#' @param go_ontology Character string specifying the GO ontology used to build
-#'   ranked gene sets for `fgsea`, commonly `"BP"`, `"MF"`, or `"CC"`.
+#' @param go_ontology Character vector specifying one or more GO ontologies used
+#'   to build ranked gene sets for `fgsea`. Supported values are `"BP"`, `"MF"`,
+#'   and `"CC"`; for example, `c("BP", "MF")`. Each ontology is analyzed in a
+#'   separate fgsea run, and results are combined in the output tables.
 #' @param methylation_array_type Character string specifying the Illumina array
 #'   type used by missMethyl to map CpGs to Entrez IDs. Supported values in this
 #'   script are `"EPIC"` and `"450K"`.
 #' @param methylation_collection Retained for compatibility with older ORA-based
-#'   methylation code paths; ranked methylation enrichment uses `go_ontology`.
+#'   methylation code paths; ranked methylation enrichment uses each ontology in `go_ontology`.
 #' @param qvalue_cutoff Numeric adjusted p-value cutoff used for reported
-#'   enrichment results, including fgsea results for expression, proteomics, and
-#'   methylation views.
-#' @param report_significance_cutoff Numeric significance threshold used when generating the
-#'   factor-level interpretation text and filtering enrichment rows in the PDF
-#'   report. Rows are shown only when both `p.adjust` and `qvalue` are below
-#'   this threshold.
+#'   enrichment results. For fgsea, adjusted p-values are calculated separately
+#'   within each requested GO ontology; the cutoff is also applied uniformly to
+#'   metabolomics ORA results.
+#' @param report_significance_cutoff Numeric significance threshold used when
+#'   generating factor-level interpretation text and filtering enrichment rows
+#'   in the PDF report. Rows are shown only when `p.adjust` is below this threshold.
 #' @param metabolon_term_cols Character vector naming Metabolon annotation
 #'   columns used for metabolomics categorical enrichment.
 #' @param render_report Logical. If `TRUE`, render a PDF report after running
@@ -2062,27 +2322,26 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 #'   top loaded feature tables in the PDF report. Defaults to `FALSE` to keep
 #'   the report focused on enrichment summaries.
 #' @param save_loadings Logical. If `TRUE`, save information about features and 
-#'   feature loadings in a number of CSV files. 
+#'   feature loadings in a number of Excel files. 
 #' @param report_engine Character string specifying the report engine. Use
 #'   `"base_pdf"` to generate a PDF directly with base R graphics without
 #'   Pandoc or LaTeX. Use `"rmarkdown_pdf"` for a more polished PDF that
 #'   requires rmarkdown, Pandoc, and LaTeX.
 #' @param n_cores Number of task-level parallel workers for enrichment analyses.
-#'   The number of enrichment analyses that will performed equal (1) the number
-#'   of factors specified in argument `factors`times (2) the number of data 
-#'   views in the MOFA results object passed as the value of `mofa_obj`. Each
-#'   of the `n_cores` specified will be dispatched to handle a single enrichment
-#'   analysis. Use `n_cores = 1` for serial execution. On Windows, parallel task 
-#'   execution requires the optional `future` and `future.apply` packages.
+#'   Ranked tasks are defined by factor and omics view; when multiple GO
+#'   ontologies are requested, the ontology-specific fgsea runs are performed
+#'   within that factor/view task. Metabolomics ORA tasks remain factor/view/
+#'   direction specific. Use `n_cores = 1` for serial execution. On Windows,
+#'   parallel task execution requires the optional `future` and `future.apply`
+#'   packages.
 #' @param fgsea_nproc Number of CPUs passed to `fgsea::fgsea()` inside each
 #'   expression, proteomics, or methylation enrichment task. Keep this at `1`
 #'   when `n_cores > 1` to avoid oversubscribing CPUs. 
 #'
-#' @return Invisibly returns a named list containing `loadings`,
-#'   `variance_explained`, `selected_features`, `top_features`,
-#'   `enrichment_results`, `interpretations`, `parameters`, and, when
-#'   `render_report = TRUE`, `report_path`. The same core result tables are also
-#'   written to CSV files in `output_dir`.
+#' @return Invisibly returns the full in-memory results list used by the report
+#'   renderer. The persisted RDS file contains only `enrichment_results`,
+#'   `interpretations`, and `parameters`. Enrichment results are also written to
+#'   an Excel workbook in `output_dir`.
 #'
 #' @examples
 #' # mofa_obj <- readRDS("path/to/mofa_results_object.rds")
@@ -2090,9 +2349,10 @@ render_mofa_report_rmarkdown_pdf <- function(results,
 #' # res <- run_mofa_integrative_interpretation(
 #' #   mofa_obj = mofa_obj,
 #' #   metabolon_annotation = metabolon_annot,
-#' #   output_dir = "mofa_factor_interpretation_report",
+#' #   output_dir = "mofa_factor_interpretation",
 #' #   metabolomics_feature_col = "BIOCHEMICAL",
 #' #   expression_id_type = "auto",
+#' #   go_ontology = c("BP", "MF"),
 #' #   methylation_array_type = "EPIC",
 #' #   render_report = TRUE,
 #' #   include_top_features_in_report = FALSE,
@@ -2131,6 +2391,11 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 	selection_mode <- match.arg(selection_mode)
 	expression_id_type <- match.arg(expression_id_type)
 	methylation_array_type <- match.arg(methylation_array_type)
+	go_ontology <- validate_go_ontologies(go_ontology)
+	
+	# Use the requested ontology codes in output filenames. For example,
+	# c("BP", "MF") produces the suffix "BP_MF".
+	go_ontology_label <- paste(go_ontology, collapse = "_")
 	
 	# Select the PDF rendering backend. The default base_pdf engine writes the
 	# report directly with grDevices::pdf() and therefore does not need Pandoc.
@@ -2186,6 +2451,34 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			fgsea_nproc = fgsea_nproc
 	)
 	
+	# Apply the requested adjusted-p-value cutoff uniformly across enrichment
+	# methods. fgsea applies this cutoff internally, whereas metabolomics ORA does
+	# not, so filtering the combined results here ensures consistent behavior.
+	enrichment_results <- enrichment_results %>%
+			filter(is.na(qvalue_cutoff) | (!is.na(p.adjust) & p.adjust <= qvalue_cutoff))
+
+	# Consolidate enrichment outputs from fgsea and ORA into a common schema.
+	# Prefer the standardized columns populated by the enrichment helpers, while
+	# retaining method-specific statistics that are not redundant.
+	enrichment_results <- enrichment_results %>%
+			mutate(
+				database = as.character(database),
+				term = dplyr::coalesce(as.character(ID), as.character(term)),
+				Description = as.character(Description),
+				`Leading edge/members` = dplyr::coalesce(
+					as.character(geneID),
+					as.character(selected_features_in_term)
+				)
+			) %>%
+			select(
+				-any_of(c(
+					"term_type", "ID", "pathway", "term_background_n",
+					"term_selected_n", "selected_features_in_term", "geneID",
+					"pval", "padj", "qvalue", "size", "leadingEdge"
+				))
+			) %>%
+			relocate(database, term, Description, .after = direction)
+
 	message("Generating factor-level interpretation text...")
 	factor_ids <- sort(unique(loadings$factor))
 	interpretations <- setNames(
@@ -2226,14 +2519,158 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 	)
 	
 	dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-	saveRDS(results, file.path(output_dir, 
-					paste0("mofa_integrative_results_", go_ontology, ".rds")))
-	write_csv(enrichment_results, file.path(output_dir, 
-					paste0("enrichment_results_", go_ontology, ".csv")))
+	# Write machine-readable result tables as Excel workbooks using the xlsx package.
+	require_namespace("xlsx", "writing Excel result files")
+
+	# xlsx::write.xlsx() cannot write list columns directly. fgsea results can
+	# contain list-valued columns (for example, leadingEdge), including empty
+	# list elements. Convert list columns only in this temporary Excel-specific
+	# copy, leaving enrichment_results and the saved RDS object unchanged.
+	enrichment_results_xlsx <- enrichment_results %>%
+			mutate(
+					across(
+							where(is.list),
+							~ vapply(
+									.x,
+									function(x) {
+										if (length(x) == 0 || all(is.na(x))) {
+											return(NA_character_)
+										}
+										paste(x, collapse = " / ")
+									},
+									character(1)
+							)
+					)
+			)
+
+	# Write the enrichment workbook, then attach concise explanatory comments to
+	# recognized header cells so users can inspect column definitions in Excel.
+	enrichment_xlsx_path <- file.path(
+			output_dir, paste0("enrichment_results_", go_ontology_label, ".xlsx")
+	)
+	xlsx::write.xlsx(
+			as.data.frame(enrichment_results_xlsx),
+			enrichment_xlsx_path,
+			row.names = FALSE
+	)
+
+	# Define in-place help for the consolidated enrichment-result columns.
+	header_comments <- c(
+		factor = "MOFA factor for which the enrichment analysis was performed.",
+		view = "MOFA data view from which the enrichment result was obtained.",
+		direction = paste0(
+			"'ranked' for fgsea analyses using the complete signed loading vector; ",
+			"'positive' or 'negative' for ORA analyses of selected features."
+		),
+		database = "Gene-set, pathway, or annotation database used for enrichment analysis.",
+		term = "Identifier of the enriched gene set, pathway, or annotation term.",
+		Description = "Human-readable description of the enriched term.",
+		GeneRatio = paste0(
+			"For ORA, number of selected features in the term divided by the total ",
+			"number of selected features; not applicable to fgsea."
+		),
+		BgRatio = paste0(
+			"For ORA, number of background features in the term divided by the total ",
+			"background universe; not applicable to fgsea."
+		),
+		Count = paste0(
+			"For ORA, number of selected features belonging to the term; for fgsea, ",
+			"size of the tested gene set in the ranked universe."
+		),
+		pvalue = "Nominal enrichment p-value before multiple-testing correction.",
+		`p.adjust` = "Enrichment p-value adjusted for multiple testing.",
+		`Leading edge/members` = paste0(
+			"For fgsea, genes in the leading-edge subset; for ORA, selected factor ",
+			"features belonging to the enriched term."
+		),
+		log2err = paste0(
+			"fgsea estimate of uncertainty in the calculated p-value on a log2 scale; ",
+			"applicable only to fgsea results."
+		),
+		ES = "fgsea enrichment score; applicable only to fgsea results.",
+		NES = paste0(
+			"fgsea normalized enrichment score. Positive and negative values indicate ",
+			"enrichment toward the corresponding ends of the signed loading ranking."
+		)
+	)
+
+	# Reopen the workbook and add comments only to columns that are actually present.
+	# The xlsx package's createCellComment() helper creates its ClientAnchor at A1
+	# before associating the comment with the supplied cell. Apache POI therefore
+	# rejects the second comment as a duplicate A1 comment. Create the POI comment
+	# directly instead, explicitly anchoring each comment at its own header cell.
+	wb <- xlsx::loadWorkbook(enrichment_xlsx_path)
+	sheet <- xlsx::getSheets(wb)[[1]]
+	header_row <- xlsx::getRows(sheet, rowIndex = 1)
+	if (length(header_row) != 1L) {
+		stop("Could not uniquely identify Excel header row 1.", call. = FALSE)
+	}
+	header_row_poi <- header_row[[1]]
+
+	# Create the workbook-level helper and sheet drawing once, then reuse them for
+	# all comments. POI uses zero-based row and column coordinates.
+	factory <- rJava::.jcall(
+		wb,
+		"Lorg/apache/poi/ss/usermodel/CreationHelper;",
+		"getCreationHelper"
+	)
+	drawing <- rJava::.jcall(
+		sheet,
+		"Lorg/apache/poi/ss/usermodel/Drawing;",
+		"createDrawingPatriarch"
+	)
+
+	for (i in seq_along(names(enrichment_results_xlsx))) {
+		col_name <- names(enrichment_results_xlsx)[i]
+		if (col_name %in% names(header_comments)) {
+			# Retrieve the existing header cell from row 1.
+			header_cell <- rJava::.jcall(
+				header_row_poi,
+				"Lorg/apache/poi/ss/usermodel/Cell;",
+				"getCell",
+				as.integer(i - 1L)
+			)
+			if (is.null(header_cell)) {
+				stop("Could not locate Excel header cell for column '", col_name,
+						"' (column ", i, ").", call. = FALSE)
+			}
+
+			# Build a unique comment anchor whose top-left corner is the current
+			# header cell. The bottom-right corner controls the default comment-box
+			# size; it does not change which cell owns the comment.
+			anchor <- rJava::.jcall(
+				factory,
+				"Lorg/apache/poi/ss/usermodel/ClientAnchor;",
+				"createClientAnchor"
+			)
+			rJava::.jcall(anchor, "V", "setCol1", as.integer(i - 1L))
+			rJava::.jcall(anchor, "V", "setCol2", as.integer(i + 2L))
+			rJava::.jcall(anchor, "V", "setRow1", as.integer(0L))
+			rJava::.jcall(anchor, "V", "setRow2", as.integer(4L))
+
+			comment <- rJava::.jcall(
+				drawing,
+				"Lorg/apache/poi/ss/usermodel/Comment;",
+				"createCellComment",
+				anchor
+			)
+			rich_text <- rJava::.jcall(
+				factory,
+				"Lorg/apache/poi/ss/usermodel/RichTextString;",
+				"createRichTextString",
+				as.character(header_comments[[col_name]])
+			)
+			rJava::.jcall(comment, "V", "setString", rich_text)
+			rJava::.jcall(comment, "V", "setAuthor", "MOFA factor interpretation")
+			rJava::.jcall(comment, "V", "setVisible", FALSE)
+			rJava::.jcall(header_cell, "V", "setCellComment", comment)
+		}
+	}
+	xlsx::saveWorkbook(wb, enrichment_xlsx_path)
 	if(save_loadings){
-		write_csv(loadings, file.path(output_dir, "all_mofa_loadings.csv"))
-		write_csv(selected_features, file.path(output_dir, "selected_factor_features.csv"))
-		write_csv(top_features, file.path(output_dir, "top_factor_features.csv"))
+		xlsx::write.xlsx(as.data.frame(loadings), file.path(output_dir, "all_mofa_loadings.xlsx"), row.names = FALSE)
+		xlsx::write.xlsx(as.data.frame(selected_features), file.path(output_dir, "selected_factor_features.xlsx"), row.names = FALSE)
+		xlsx::write.xlsx(as.data.frame(top_features), file.path(output_dir, "top_factor_features.xlsx"), row.names = FALSE)
 	}
 	
 	if (render_report) {
@@ -2244,7 +2681,7 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			report_path <- render_mofa_pdf_report_base(
 					results = results,
 					output_dir = output_dir,
-					output_file = paste0("mofa_integrative_factor_report_", go_ontology, ".pdf"),
+					output_file = paste0("mofa_integrative_factor_report_", go_ontology_label, ".pdf"),
 					report_significance_cutoff = report_significance_cutoff,
 					include_top_features = include_top_features_in_report
 			)
@@ -2254,7 +2691,7 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			report_path <- render_mofa_report_rmarkdown_pdf(
 					results = results,
 					output_dir = output_dir,
-					output_file = paste0("mofa_integrative_factor_report_", go_ontology, ".pdf"),
+					output_file = paste0("mofa_integrative_factor_report_", go_ontology_label, ".pdf"),
 					report_significance_cutoff = report_significance_cutoff,
 					include_top_features = include_top_features_in_report
 			)
@@ -2263,14 +2700,27 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 		results$report_path <- report_path
 		message("Report written to: ", report_path)
 	}
+
+	# Persist enrichment results as an R object.
+	condensed_results <- results[c("enrichment_results", "interpretations", "parameters")]
+	saveRDS(
+			condensed_results,
+			file.path(output_dir, paste0("mofa_integrative_results_", go_ontology_label, ".rds"))
+	)
 	
 	invisible(results)
 }
 
 # -----------------------------------------------------------------------------
-# Run pipeine
+# Run pipeline
 # -----------------------------------------------------------------------------
 
+# Load user-configurable run settings from the companion parameter file.
+# Both supported execution modes use source(..., chdir = TRUE), so the current
+# working directory is the directory containing this script while it executes.
+source("mofa_factors_interpretation_parameters.R", local = TRUE)
+
+# Load packages required by the configured analysis.
 library(MOFA2)
 library(org.Hs.eg.db)
 library(clusterProfiler)
@@ -2278,48 +2728,87 @@ library(fgsea)
 library(missMethyl)
 library(rmarkdown)
 
-# Specify file locations - edit according to your local execution environment
-mofa_dir <- file.path("D:/R_sessions/PROSPR/MOFA",
-		"2026_Jun_28_00_49_09_visit=24mo_change_scores_ungrouped_views=me")
-#mofa_dir <- file.path("D:/R_sessions/PROSPR/MOFA",
-#		"2026_May_15_00_40_17_visit=24mo_change_scores_ungrouped_views=me+pr+mb")
-mofa_res_fn <- file.path(mofa_dir, "model.hdf5")
-metab_ann_fn <- file.path("E:/Data/PROSPR-FAST/CALERIE/metabolomics",
-		"metabolon_annotations.csv")
-output_dir <- mofa_dir # save results at same location of MOFA results
+# Validate the required MOFA results filename before loading the model.
+if (is.null(mofa_res_fname) || length(mofa_res_fname) != 1L ||
+		is.na(mofa_res_fname) || !nzchar(mofa_res_fname)) {
+	stop("mofa_res_fname must specify the MOFA results file.", call. = FALSE)
+}
+if (!file.exists(mofa_res_fname)) {
+	stop("MOFA results file does not exist: ", mofa_res_fname, call. = FALSE)
+}
 
-mofa_obj <- MOFA2::load_model(mofa_res_fn)
-metabolon_annot <- readr::read_csv(metab_ann_fn, show_col_types = FALSE)
+mofa_obj <- MOFA2::load_model(mofa_res_fname)
+available_views <- views_names(mofa_obj)
+
+# The parameter-file convenience value views = "all" means every view present
+# in the loaded MOFA object. Otherwise use the requested view vector unchanged.
+if (length(views) == 1L && identical(tolower(as.character(views)), "all")) {
+	views_to_analyze <- available_views
+} else {
+	views_to_analyze <- views
+}
+
+# A Metabolon annotation file is required when the MOFA object contains a
+# metabolomics view. For studies without metabolomics, metab_ann_fn may be NULL.
+if ("metabolomics" %in% available_views) {
+	if (is.null(metab_ann_fn) || length(metab_ann_fn) != 1L ||
+			is.na(metab_ann_fn) || !nzchar(metab_ann_fn)) {
+		stop(
+			"metab_ann_fn must be specified because the MOFA object contains a ",
+			"metabolomics view.",
+			call. = FALSE
+		)
+	}
+	if (!file.exists(metab_ann_fn)) {
+		stop("Metabolon annotation file does not exist: ", metab_ann_fn, call. = FALSE)
+	}
+	metabolon_annot <- readr::read_csv(metab_ann_fn, show_col_types = FALSE)
+} else {
+	metabolon_annot <- NULL
+}
+
+# If no parent output directory is specified, place the results directory next
+# to the MOFA results file. The analysis itself writes into the standard
+# mofa_factor_interpretation subdirectory.
+if (is.null(output_dir)) {
+	output_dir <- dirname(normalizePath(mofa_res_fname, winslash = "/", mustWork = TRUE))
+}
+results_dir <- file.path(output_dir, "mofa_factor_interpretation")
 
 res <- run_mofa_integrative_interpretation(
 		mofa_obj = mofa_obj,
 		metabolon_annotation = metabolon_annot,
-		output_dir = file.path(mofa_dir, "mofa_factor_interpretation"),
-		views = views_names(mofa_obj),
-		factors = "all",
-		selection_mode = "top_n",
-		top_n = 100,
+		output_dir = results_dir,
+		views = views_to_analyze,
+		factors = factors,
+		selection_mode = selection_mode,
+		top_n = top_n,
+		z_cutoff = z_cutoff,
+		quantile_cutoff = quantile_cutoff,
 		min_features = 5,
 		metabolomics_feature_col = "BIOCHEMICAL",
 		expression_id_type = "auto",
 		OrgDb = "org.Hs.eg.db",
 		organism = "human",
-		go_ontology = "BP",
+		go_ontology = go_ontology,
 		methylation_array_type = "EPIC",
 		methylation_collection = "GO",
-		qvalue_cutoff = 0.1,
-		report_significance_cutoff = 0.05,
-		render_report = TRUE,
+		qvalue_cutoff = qvalue_cutoff,
+		report_significance_cutoff = report_significance_cutoff,
+		render_report = render_report,
 		report_engine = "base_pdf",
-		n_cores = 1, # Change according to your execution environment
-		fgsea_nproc = 1 # Best to leave this at 1
+		n_cores = n_cores,
+		fgsea_nproc = 1
 )
 
-# Important output files:
-#   mofa_factor_interpretation_report/mofa_integrative_factor_report.pdf
-#   mofa_factor_interpretation_report/enrichment_results.csv
+# Important output files (for go_ontology = c("BP", "MF")):
+#   mofa_integrative_factor_report_BP_MF.pdf
+#   enrichment_results_BP_MF.xlsx
+#   mofa_integrative_results_BP_MF.rds
 #   
 # To generate the files below, set the argument `save_loading` to TRUE when 
 # calling run_mofa_integrative_interpretation().
-#   mofa_factor_interpretation_report/top_factor_features.csv
-#   mofa_factor_interpretation_report/selected_factor_features.csv
+#   top_factor_features.xlsx
+#   selected_factor_features.xlsx
+#	all_mofa_loadings.xlsx
+
