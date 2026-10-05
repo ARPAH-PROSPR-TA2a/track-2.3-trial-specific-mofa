@@ -172,9 +172,10 @@ treatment_col <- "CR"
 timepoint_col <- "fumo"
 
 timepoint_labels <- setNames(
-  c(0, 12, 24),
-  c("baseline", "12mo", "24mo")
+  c(0, 12, 24, 3, 6, 18, 98, 99), 
+  c("baseline", "12mo", "24mo", "3mo", "6mo", "18mo", "BLs1", "BLs2")
 )
+
 treatment_labels <- setNames(c(0, 1), c("AL", "CR"))
 
 timepoint <- 24
@@ -713,8 +714,14 @@ For each selected view/factor combination, the script:
 2. Removes all-`NA` sample columns that may have been added to a MOFA view to
    represent missing measurements.
 3. Removes unusable features.
-4. Runs repeated internal train/test validation.
-5. Fits a final penalized regression model using the available matched samples.
+4. Runs `n_repeats` internal train/test validations. Each validation uses a `train_frac` 
+   fraction of the samples for training and the remaining samples for validation. Within 
+   each training subset, `cv.glmnet()` performs `nfolds`-fold cross-validation to select 
+   the penalization parameter, after which prediction performance is evaluated on the 
+   held-out validation samples.
+5. Fits the **final** penalized regression model using all available matched samples. The 
+   final model uses `cv.glmnet()` with `nfolds`-fold cross-validation to select the penalization 
+   parameter.
 6. Records the selected features and coefficients, as well as prediction
    performance metrics.
 7. Saves all view/factor models in a single `MofaFactorPredictor` RDS object.
