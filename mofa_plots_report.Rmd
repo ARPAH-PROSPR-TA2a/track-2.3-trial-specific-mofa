@@ -140,13 +140,29 @@ correlate_factors_with_covariates(
 )
 ```
 
-```{r factor-covariate-r, fig.width=11, fig.height=8}
-correlate_factors_with_covariates(
-  model,
-  col_names_to_use,
-  plot = "r"
+
+```{r factor-covariate-r, fig.width=12, fig.height=8}
+factor_ids <- seq_along(MOFA2::factors_names(model))
+
+factor_groups <- split(
+  factor_ids,
+  ceiling(seq_along(factor_ids) / 15)
 )
+
+for (f in factor_groups) {
+  correlate_factors_with_covariates(
+    model,
+    col_names_to_use,
+    factors = f,
+    plot = "r",
+    method = "color",
+    addCoef.col = "black",
+    number.cex = 0.8,
+    number.digits = 2
+  )
+}
 ```
+
 
 # Selected factor plots
 
