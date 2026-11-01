@@ -207,7 +207,7 @@ readMetabolomics <- function(fname, ann_fname = NULL){
 #' @examples
 #' # readPhenoData("path/to/pheno.csv")
 #' # readPhenoData("pheno.csv", select = c("age", "sex", "visit"))
-readPhenoData <- function(fname, study = NULL, select = NULL){
+readPhenoData <- function(fname, select = NULL){
 	if (!is.character(fname) || length(fname) != 1) stop("'fname' must be a single file path string")
 	if (!file.exists(fname)) stop("Phenotypic file not found: ", fname)
 
