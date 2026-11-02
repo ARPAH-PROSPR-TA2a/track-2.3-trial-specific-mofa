@@ -914,20 +914,20 @@ For a new study, the intended workflow is:
    persisted metadata/factor-value files, set `sample_id_col`, and specify `Y`,
    `X`, and `categorical`. Review both sets of regression PDF reports and the
    consolidated `regression_model_summary.xlsx`/`.rds` model summaries.
-3. **Optionally render `mofa_plots_report.Rmd`.** Edit
-   `mofa_plots_report_parameters.R` to point to the fitted `model.hdf5` and
-   select the factors, metadata variables, views, feature-weight, heatmap, and
-   dimensionality-reduction settings of interest.
-4. **Configure and run `mofa_factor_interpretation.R`.** Edit
-   `mofa_factors_interpretation_parameters.R` to identify the fitted MOFA model,
-   select the factors/views and GO ontologies to analyze, set enrichment/report
-   thresholds, and configure parallelization. Review the generated enrichment
-   workbook and optional PDF interpretation report.
-5. **Configure and run `mofa_train_glm.R`.** Edit
+3. **Configure and run `mofa_train_glm.R`.** Edit
    `mofa_train_glm_parameters.R` to point to the `model.hdf5` file and select
    the factors/views to evaluate. Use the training report and internal-CV
    metrics to assess view-specific predictability and retain the resulting
    `mofa_glm_predictor.rds`.
+4. **Optionally render `mofa_plots_report.Rmd`.** Edit
+   `mofa_plots_report_parameters.R` to point to the fitted `model.hdf5` and
+   select the factors, metadata variables, views, feature-weight, heatmap, and
+   dimensionality-reduction settings of interest.
+5. **Optionally configure and run `mofa_factor_interpretation.R`.** Edit
+   `mofa_factors_interpretation_parameters.R` to identify the fitted MOFA model,
+   select the factors/views and GO ontologies to analyze, set enrichment/report
+   thresholds, and configure parallelization. Review the generated enrichment
+   workbook and optional PDF interpretation report.
 
 ## External-study workflow
 
@@ -946,7 +946,7 @@ values without refitting MOFA:
 5. Use the resulting samples x factors matrix in the external study's own
    statistical analyses, while retaining the generated `logs` folder and
    `README.txt` for provenance.
-6. **Optionally run `regress_mofa_factors.R`** to test associations between the
+6. **Configure and run `regress_mofa_factors.R`** to test associations between the
    externally estimated factors and the external study's metadata. In
    `regression_parameters.R`, select the persisted-file input mode, set
    `sample_metadata_fname` to the generated `sample_metadata.xlsx` or `.rds`
