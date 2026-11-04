@@ -2,12 +2,12 @@
 # Open files, prepare data, and run MOFA analysis.
 #
 # User-configurable analysis settings, input-file locations, and optional omics
-# view definitions are maintained in MOFA_parameters.R.
+# view definitions are maintained in mofa_parameters.R.
 #
-# After configuring the analysis settings in MOFA_parameters.R, run this script
+# After configuring the analysis settings in mofa_parameters.R, run this script
 # from an R session:
 #
-#   source("path_to_mofa_code/MOFA_analysis.R", local = TRUE, chdir = TRUE)
+#   source("path_to_mofa_code/mofa_analysis.R", local = TRUE, chdir = TRUE)
 #
 # The chdir = TRUE argument temporarily sets the working directory to the folder
 # containing this script, allowing it to locate the supporting R files. Any
@@ -15,7 +15,7 @@
 #
 # Alternatively, run the script from the command line:
 #
-#   Rscript.exe -e "source('path_to_mofa_code/MOFA_analysis.R', local = TRUE, 
+#   Rscript.exe -e "source('path_to_mofa_code/mofa_analysis.R', local = TRUE, 
 #				chdir = TRUE)"
 #
 # Running from an R session is recommended for capturing the model-training log.
@@ -25,6 +25,20 @@
 # when the script is launched with Rscript.exe.
 # *****************************************************************************
 
+# Capture R output from the start, including startup messages and warnings.
+# The temporary log is copied to the results folder when the run ends. If the
+# run fails before that folder exists, the temporary path is reported instead.
+console_log_temp <- tempfile("mofa_console_", fileext = ".txt")
+console_log_con <- file(console_log_temp, open = "wt")
+initial_output_sinks <- sink.number(type = "output")
+initial_message_sink <- sink.number(type = "message")
+previous_warn_option <- getOption("warn")
+console_log_folder <- NULL
+sink(console_log_con, split = TRUE)
+sink(console_log_con, type = "message")
+options(warn = 1)  # Print warnings immediately so they are included in the log.
+
+tryCatch({
 library(MOFA2)
 library(dplyr)
 library(tidyr)
@@ -33,7 +47,7 @@ library(xlsx)
 # Source the file readers that parse the input files
 source("file_readers.R", local = TRUE)
 # Load user-configurable settings
-source("MOFA_parameters.R", local = TRUE)
+source("mofa_parameters.R", local = TRUE)
 source("methods.R", local = TRUE)
 
 # Read and validate the clinical data and shared study settings.
@@ -44,13 +58,26 @@ target_timepoint_label <- clinical_context$target_timepoint_label
 
 validateOmicsInputDefinitions(omics_input_defs)
 
+# The batch orchestrator supplies this optional selection in the script's own
+# environment. Standalone runs continue to use every configured input.
+if (exists(".mofa_run_views", inherits = FALSE)) {
+  requested_views <- .mofa_run_views
+  if (!is.character(requested_views) || !length(requested_views) ||
+      anyNA(requested_views) || any(!nzchar(requested_views)) ||
+      anyDuplicated(requested_views) ||
+      any(!requested_views %in% names(omics_input_defs))) {
+    stop("Invalid orchestrated omics view selection.", call. = FALSE)
+  }
+  omics_input_defs <- omics_input_defs[requested_views]
+}
+
 # Read only omics views whose configured file variables are defined.
 loaded_info <- loadConfiguredOmicsViews(omics_input_defs)
 loaded_views <- loaded_info$loaded_views
 barcode_cols <- loaded_info$barcode_cols
 
 if (length(loaded_views) == 0){
-  message("No omics data file names are defined in MOFA_parameters.R. ",
+  message("No omics data file names are defined in mofa_parameters.R. ",
       "Writing sample metadata only; MOFA will not be run.")
 
   sample_metadata <- buildTargetVisitSampleMetadata(pheno_d)
@@ -62,6 +89,7 @@ if (length(loaded_views) == 0){
   dir.create(res_folder, recursive = TRUE)
   log_folder <- file.path(res_folder, "logs")
   dir.create(log_folder, recursive = TRUE, showWarnings = FALSE)
+  console_log_folder <- log_folder
 
   sample_metadata_xlsx <- file.path(res_folder, "sample_metadata.xlsx")
   xlsx::write.xlsx(as.data.frame(sample_metadata), sample_metadata_xlsx,
@@ -71,7 +99,7 @@ if (length(loaded_views) == 0){
   session_file <- file.path(log_folder, "sessionInfo.txt")
   writeLines(capture.output(sessionInfo()), session_file)
   file.copy(
-      from = c("MOFA_analysis.R", "MOFA_parameters.R", "file_readers.R", "methods.R"),
+      from = c("mofa_analysis.R", "mofa_parameters.R", "file_readers.R", "methods.R"),
       to = log_folder,
       overwrite = TRUE
   )
@@ -80,11 +108,11 @@ if (length(loaded_views) == 0){
   readme_text <- paste(c(
       paste(study_name, "sample metadata were exported for target visit",
           target_timepoint_label, "."),
-      "No omics data file names were defined in MOFA_parameters.R, so",
+      "No omics data file names were defined in mofa_parameters.R, so",
       "MOFA preprocessing and model training were skipped.",
       "The result files are sample_metadata.xlsx and sample_metadata.rds.",
-      "The logs folder contains sessionInfo.txt, which records the R/package",
-      "environment, plus copies of MOFA_analysis.R, MOFA_parameters.R,",
+      "The logs folder contains console_out.txt, sessionInfo.txt, which records the R/package",
+      "environment, plus copies of mofa_analysis.R, mofa_parameters.R,",
       "file_readers.R, and methods.R used for the run."
   ), collapse = " ")
   writeLines(strwrap(readme_text, width = 80), con = readme_file)
@@ -100,6 +128,12 @@ data_views <- prepareConfiguredOmicsViews(
   timepoint = timepoint,
   use_change_scores = use_change_scores
 )
+if (exists(".mofa_run_views", inherits = FALSE) &&
+    !setequal(names(data_views), .mofa_run_views)) {
+  stop("Requested view(s) missing after preprocessing: ",
+       paste(setdiff(.mofa_run_views, names(data_views)), collapse = ", "),
+       call. = FALSE)
+}
 if (length(data_views) == 0L) {
   stop("No omics views have samples at the requested timepoint.", call. = FALSE)
 }
@@ -271,15 +305,24 @@ res_folder <- paste(output_dir,
 				"_visit=", target_timepoint_label, "_", score_tag,
 				"_views=", views_tag),
 		sep = "/")
+if (exists(".mofa_run_views", inherits = FALSE) && dir.exists(res_folder)) {
+  stop("Result folder already exists; refusing to overwrite: ", res_folder,
+       call. = FALSE)
+}
 log_folder <- file.path(res_folder, "logs")
 res_file <- file.path(res_folder, "model.hdf5")
 log_file <- file.path(log_folder, "mofa_out.txt")
 dir.create(log_folder, recursive = TRUE, showWarnings = FALSE)
+console_log_folder <- log_folder
+
+# Capture training and quality-control output together; messages and warnings
+# continue to go to console_out.txt. Restore the output sink even on error.
 sink(file = log_file)
-mo.tr <- tryCatch(
-		run_mofa(mo, res_file, use_basilisk = TRUE),
-		finally = sink()
-)
+mo.tr <- tryCatch({
+        fitted_model <- run_mofa(mo, res_file, use_basilisk = TRUE)
+        MOFA2:::.quality_control(fitted_model)
+        fitted_model
+    }, finally = sink())
 
 # Export fitted factor values, feature weights, and sample metadata in both
 # Excel and RDS formats. Excel workbooks are written with the xlsx package.
@@ -312,7 +355,7 @@ saveRDS(sample_metadata, file.path(res_folder, "sample_metadata.rds"))
 session_file <- file.path(log_folder, "sessionInfo.txt")
 writeLines(capture.output(sessionInfo()), session_file)
 file.copy(
-		from = c("MOFA_analysis.R", "MOFA_parameters.R",
+		from = c("mofa_analysis.R", "mofa_parameters.R",
 				"file_readers.R", "methods.R"),
 		to = log_folder,
 		overwrite = TRUE
@@ -327,7 +370,7 @@ score_desc <- if (use_change_scores){
 		}
 
 included_views <- paste(names(data_views), collapse = ", ")
-# Pull view-specific prose from MOFA_parameters.R for the selected score mode.
+# Pull view-specific prose from mofa_parameters.R for the selected score mode.
 data_notes <- vapply(names(data_views), function(view_name){
 			omics_input_defs[[view_name]]$readme_notes[[score_tag]]
 		}, character(1))
@@ -341,11 +384,42 @@ readme_text <- paste(c(
 				"Result files in this folder include model.hdf5, factor_values.xlsx,",
 				"factor_values.rds, feature_weights.xlsx, feature_weights.rds,",
 				"sample_metadata.xlsx, and sample_metadata.rds.",
-				"The logs folder contains mofa_out.txt (captured model-training output),",
+				"The logs folder contains mofa_out.txt (model-training and quality-control output),",
+				"console_out.txt (other R output, messages, and warnings),",
 				"sessionInfo.txt (the R/package environment), and copies of",
-				"MOFA_analysis.R, MOFA_parameters.R, file_readers.R, and methods.R",
+				"mofa_analysis.R, mofa_parameters.R, file_readers.R, and methods.R",
 				"used for the run."
 		), collapse = " ")
 
 writeLines(strwrap(readme_text, width = 80), con = readme_file)
+# Communicate the actual model path only after the complete analysis succeeds.
+if (exists(".mofa_run_views", inherits = FALSE)) {
+  .mofa_run_model <- normalizePath(res_file, winslash = "/", mustWork = TRUE)
 }
+}
+
+}, error = function(e) {
+  # Record the error before restoring the original message stream.
+  cat("Error: ", conditionMessage(e), "\n", file = console_log_con, sep = "")
+  stop(e)
+}, finally = {
+  while (sink.number(type = "output") > initial_output_sinks) sink()
+  if (initial_message_sink == 2L) {
+    sink(type = "message")
+  } else {
+    sink(getConnection(initial_message_sink), type = "message")
+  }
+  options(warn = previous_warn_option)
+  close(console_log_con)
+  if (!is.null(console_log_folder) && dir.exists(console_log_folder)) {
+    console_log_destination <- file.path(console_log_folder, "console_out.txt")
+    if (file.copy(console_log_temp, console_log_destination, overwrite = TRUE)) {
+      unlink(console_log_temp)
+    } else {
+      message("Could not save console log to results folder; it remains at: ",
+              console_log_temp)
+    }
+  } else {
+    message("Console log is available at: ", console_log_temp)
+  }
+})

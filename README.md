@@ -1,36 +1,83 @@
 # MOFA analysis workflow
 
-This repository contains a reusable workflow for fitting Multi-Omics Factor
-Analysis (MOFA) models to study-specific omics data and carrying out
-post-MOFA analyses of the learned factors. The analysis code itself is intended to be reusable
-across studies; the parameter files specify study-specific input files,
-clinical column names, labels, preprocessing choices, and downstream analysis
-settings.
+This repository provides a reusable workflow for studies with clinical data and
+one or more omics data matrices, such as methylation, proteomics, or
+metabolomics. It uses Multi-Omics Factor Analysis (MOFA) to learn latent factors
+that capture patterns of variation in the omics data, and supports analysis of
+how those factors relate to clinical variables. Study-specific parameter files
+supply the input paths, clinical column names, preprocessing choices, and
+analysis settings.
 
-The main analysis workflow is:
+## Two ways to use the workflow
 
-1. **Run `mofa_analysis.R`** to prepare the selected omics views and fit a MOFA
-   model.
-2. **Run `regress_mofa_factors.R`** to test associations between MOFA factors
-   and selected sample-level metadata variables.
-3. **Render `mofa_plots_report.Rmd`** to generate an optional visual report of
-   the fitted MOFA model.
-4. **Run `mofa_factor_interpretation.R`** to generate an optional biological
-   interpretation report for the fitted factors.
-5. **Run `mofa_train_glm.R`** to train view-specific LASSO/elastic-net models
-   that predict the MOFA factor values learned in step 1.
+Your study can act as the **training study**, which trains the MOFA model, or as
+a **test study**, which uses factor-estimation artifacts from a model
+trained elsewhere. The same study can play either role in different analyses.
 
-The files `glm_factor_estimate.R` and `project_mofa_factors.R` are intended for
-use by **external studies** after the primary MOFA model has been learned. They
-allow a study that did not participate in MOFA fitting to estimate the learned
-factor values for its own samples using either trained GLM predictors or the
-saved MOFA feature weights. These external-scoring workflows are described
-below.
+### Training study: learn factors and prepare them for test-study estimation
+
+The training study workflow comprises the following analysis scripts, each
+with a parameter file for its run settings:
+
+1. `mofa_analysis.R` fits MOFA to the study's omics data and saves the learned
+   factor values and feature weights, among other outputs.
+2. `regress_mofa_factors.R` assesses associations between the learned factors
+   and clinical variables in the study.
+3. `mofa_train_glm.R` trains view-specific GLM/LASSO predictors of the learned
+   factors. The resulting `mofa_glm_predictor.rds` and the `feature_weights.rds`
+   saved by `mofa_analysis.R` can be provided to test studies, which can use them
+   to estimate factor values for their own samples.
+4. Two additional steps are optional:
+   - `mofa_factor_interpretation.R` runs enrichment analyses to investigate the
+     biological meaning of the factors.
+   - `mofa_plots_report.Rmd` can be rendered to explore the fitted model
+     visually.
+
+Each script can be configured and executed individually. However, we recommend
+using `run_mofa_workflow.R` to execute the three required steps across multiple
+combinations of omics views. Fitting MOFA using all available views can reveal
+factors that capture shared variation across views and help elucidate biology.
+Factors useful for the study's goals—for example, identifying predictors of
+treatment response or treatment effect—may also emerge when MOFA is fitted to
+only a subset of the views. We therefore recommend fitting MOFA to **all
+nonempty combinations** of available views.
+
+To use the automated workflow:
+
+1. Edit the script-specific parameter files to specify the input file locations
+   and other relevant run settings.
+2. Edit `configure_runs.txt` to list the desired omics view combinations, one per
+   line (see the example below). The combinations must be listed explicitly;
+   they are not generated automatically.
+3. Run `run_mofa_workflow.R` to perform MOFA fitting, regression, and GLM
+   training for each listed combination.
+
+For fitted models of interest, you can also run `mofa_factor_interpretation.R`
+and render `mofa_plots_report.Rmd`.
+
+### Test study: estimate factors learned by another study
+
+1. Obtain a trained `mofa_glm_predictor.rds` and/or `feature_weights.rds` from
+   the study that fitted the MOFA model, together with the information needed
+   to make your data compatible with its feature identifiers and preprocessing.
+2. Use `glm_factor_estimate.R` for GLM-based estimation and/or
+   `project_mofa_factors.R` for projection using the feature weights. These
+   approaches estimate the previously learned factors for your samples without
+   refitting MOFA.
+3. Run `regress_mofa_factors.R` on the estimated factor values and your study's
+   sample metadata to assess their associations with your clinical variables.
+
+The sections below describe the files, configuration, and outputs for each
+step. The [recommended end-to-end workflow](#recommended-end-to-end-workflow)
+provides a concise checklist for each study mode.
 
 ## Files in the repository
 
 | File | Purpose |
 |---|---|
+| `check_environment.R` | Checks R files for package references and reports packages missing from the current R environment. |
+| `configure_runs.txt` | Comma-separated omics view combinations for the recommended automated workflow. |
+| `run_mofa_workflow.R` | Runs MOFA fitting, regression, and GLM training for each configured view combination. |
 | `mofa_parameters.R` | Main configuration file for `mofa_analysis.R`. Defines study-specific settings, analysis parameters, input-file locations, and optional omics-view definitions. |
 | `mofa_analysis.R` | Main MOFA workflow. Reads the clinical and omics data, performs the configured preprocessing, fits the MOFA model, and writes the model and derived factor/weight/metadata files. It can also perform a metadata-only run when no omics files are specified. |
 | `file_readers.R` | Study-specific file-reader functions used to convert the clinical and omics input files into the formats expected by the workflow. It currently contains `readPhenoData()`, `readMethylation()`, `readProteomics()`, and `readMetabolomics()`. |
@@ -42,13 +89,31 @@ below.
 | `mofa_factors_interpretation_parameters.R` | Configuration file for `mofa_factor_interpretation.R`. Identifies the fitted MOFA model and optional Metabolon annotation file and controls view/factor selection, feature-selection settings, GO ontologies, significance thresholds, report generation, and parallelization. |
 | `mofa_factor_interpretation.R` | Biological interpretation workflow for fitted MOFA factors. Performs ranked GO enrichment for gene-oriented views, Metabolon over-representation analysis, and optional PDF reporting. |
 | `mofa_train_glm_parameters.R` | Configuration file for `mofa_train_glm.R`. Identifies the fitted MOFA model and controls factor/view selection, repeated validation, elastic-net settings, parallelization, and the training report. |
-| `mofa_train_glm.R` | Trains view-specific LASSO/elastic-net models that predict the learned MOFA factors from individual omics views. The resulting predictor object is used for later external factor estimation. |
-| `glm_factor_estimate_parameters.R` | Configuration file for applying trained GLM factor predictors to an external study. Defines the trained predictor, external data files, preprocessing, and prediction options. |
-| `glm_factor_estimate.R` | Estimates learned MOFA factor values in an external dataset using the view-specific GLM/LASSO predictors trained by `mofa_train_glm.R`. |
-| `project_mofa_factors_parameters.R` | Configuration file for projecting an external dataset directly onto learned MOFA feature weights. |
-| `project_mofa_factors.R` | Estimates MOFA factor values in an external dataset by applying saved MOFA feature weights to the corresponding external omics views. |
+| `mofa_train_glm.R` | Trains view-specific LASSO/elastic-net models that predict the learned MOFA factors from individual omics views. The resulting predictor object is used for later test-study factor estimation. |
+| `glm_factor_estimate_parameters.R` | Configuration file for applying trained GLM factor predictors to a test study. Defines the trained predictor, test-study data files, preprocessing, and prediction options. |
+| `glm_factor_estimate.R` | Estimates learned MOFA factor values in a test-study dataset using the view-specific GLM/LASSO predictors trained by `mofa_train_glm.R`. |
+| `project_mofa_factors_parameters.R` | Configuration file for projecting a test-study dataset directly onto learned MOFA feature weights. |
+| `project_mofa_factors.R` | Estimates MOFA factor values in a test-study dataset by applying saved MOFA feature weights to the corresponding test-study omics views. |
 
 ## Required R packages
+
+Before running the workflow, place `check_environment.R` in the directory
+containing the workflow's R files and run it from the R session you intend to
+use, for example in RGui:
+
+```r
+source("/path_to_mofa_files/check_environment.R", local = TRUE, chdir = TRUE)
+```
+
+The script scans the R files for package references and checks whether the
+identified packages are installed in the current R environment. It reports
+when all identified packages are installed or prints an `install.packages()`
+call for missing packages. Review any package calls flagged for manual review:
+package names computed dynamically may not be identifiable by scanning the
+source. Some packages, including Bioconductor packages, may require their
+appropriate installation method rather than `install.packages()` alone. The
+check does not establish that non-R dependencies are available or that the
+workflow will run successfully.
 
 The primary MOFA workflow explicitly uses:
 
@@ -109,6 +174,9 @@ the workflow. The shared processing and validation logic belongs in
 
 ## Running the scripts
 
+For training studies, the automated workflow described below is recommended.
+Individual scripts can also be run independently as described in their sections.
+
 The scripts are designed to be run after configuring the corresponding
 parameter file. When a script sources supporting files using relative paths,
 run it from the repository directory or use `source(..., chdir = TRUE)` so that
@@ -131,6 +199,68 @@ Running `mofa_analysis.R` from an R session is recommended when MOFA training
 output needs to be captured in the log, because `MOFA2::run_mofa()` executes
 Python code in a separate environment and its progress messages are not always
 routed through R's standard output when launched through `Rscript.exe`.
+
+## Automated runs for multiple omics combinations
+
+Use `run_mofa_workflow.R` to run MOFA fitting, factor regression, and GLM
+training in sequence for each combination explicitly listed in `configure_runs.txt`. These are
+the same three scripts described below; the other optional workflow steps are
+not run by the orchestrator.
+
+1. In `mofa_parameters.R`, define the clinical file and the file paths for
+   **every** omics view you intend to use. Leave all those paths uncommented.
+   Configure the remaining MOFA settings as usual.
+2. Set the analysis options in `regression_parameters.R` and
+   `mofa_train_glm_parameters.R`. During automated runs, the orchestrator
+   supplies the newly fitted model path, so the `mofa_res_fname` values in
+   these two files do not need to be changed between runs. Regression is forced
+   to use the fitted-model input mode, even if the parameter file specifies
+   metadata and factor-value files.
+3. Edit `configure_runs.txt`, placing one combination per line. Names are
+   case-sensitive and must match the names in `omics_input_defs`; for example:
+
+   ```text
+   methylation
+   proteomics
+   metabolomics
+   methylation, proteomics
+   methylation, metabolomics
+   proteomics, metabolomics
+   methylation, proteomics, metabolomics
+   ```
+
+   This example lists all seven nonempty combinations of three views. Adapt it
+   to your available views; with *n* views there are 2^n - 1 combinations, so
+   consider the computational time required. Blank lines and lines beginning
+   with `#` are ignored. Remove the `#` from
+   the supplied example lines or replace them with your own combinations. Empty
+   or repeated names, unknown views, repeated combinations (including a
+   different ordering), and missing configured input files stop the batch
+   before model training. Any extra files needed by a custom reader must also
+   be configured in the usual way.
+4. Run from an R session (or use the equivalent `Rscript.exe -e` invocation):
+
+   ```r
+   source("/path_to_mofa_files/run_mofa_workflow.R", local = TRUE, chdir = TRUE)
+   ```
+
+The scripts use the same working-directory and relative-path conventions as
+standalone runs. Each step is sourced in a fresh R environment. The MOFA model
+path is passed directly to the other steps; the parameter files are not edited.
+If an input view has no eligible samples after preprocessing, that combination
+fails rather than fitting a model with fewer views. When MOFA fails, the two
+subsequent steps are skipped. If regression fails, GLM training is still
+attempted using the successfully fitted model; failures in any step do not
+prevent the next combination from being attempted.
+
+A uniquely named `workflow_summary_*.csv` is written in `output_dir` and updated
+throughout the batch. It records the configuration line, views, model path,
+step statuses, and error messages. Results and per-run logs remain in their
+normal run folders. A pre-existing run folder with the same generated name is
+not overwritten by an automated run. As with standalone runs, model training
+may take a long time, and capturing Python training output is more reliable
+from an R session. Standalone execution and its parameter-file behavior remain
+available.
 
 # 1. Fit the MOFA model with `mofa_analysis.R`
 
@@ -250,7 +380,7 @@ For a normal MOFA run, the script:
 12. Exports the learned factor values, feature weights, and sample metadata in
     both Excel and RDS formats. The persisted feature weights can subsequently
     be used by `project_mofa_factors.R` to project the learned MOFA factors in
-    external studies.
+    test studies.
 13. Saves the training log, session information, and source/configuration files
     in the result folder's `logs` subfolder for provenance.
 
@@ -360,7 +490,7 @@ factor_values_fname <- "path/to/factor_values.xlsx"
 or use the corresponding `.rds` files. The two files may independently be
 Excel or RDS files.
 
-The second mode is primarily intended for use by external studies where factor
+The second mode is primarily intended for use by test studies where factor
 values are estimated by either applying a trained GLM generated from a MOFA 
 model or via direct MOFA factor projection. Accordingly, in this mode,
 although the metadata and factor-value tables may be constructed manually 
@@ -381,7 +511,7 @@ factor-values matrix is present in the configured sample-ID column of the
 metadata table. If any IDs are missing, execution stops with an informative
 error listing them.
 
-For files generated by the external-study workflows, set `factor_values_fname`
+For files generated by the test-study workflows, set `factor_values_fname`
 to `glm_factor_values.xlsx`/`.rds` or
 `mofa_factor_projection.xlsx`/`.rds`, as appropriate. Direct regression input
 requires one samples x factors matrix. If `combine_views = "none"` was used,
@@ -484,7 +614,8 @@ run.
 # 3. Visualize the fitted MOFA model with `mofa_plots_report.Rmd` (optional)
 
 The plotting report reads an existing fitted `model.hdf5` file and generates
-exploratory plots. It does not refit MOFA.
+exploratory plots of the fitted model and its training data. It does not refit
+MOFA or plot factor values estimated in a test study.
 
 ## Configure `mofa_plots_report_parameters.R`
 
@@ -669,11 +800,11 @@ features, and variance explained, remains available in the in-memory object
 the optional loading/feature Excel files because `save_loadings` retains its
 default value of `FALSE`.
 
-# 5. Train external factor predictors with `mofa_train_glm.R`
+# 5. Train factor predictors for test studies with `mofa_train_glm.R`
 
 The fifth step assesses whether the learned MOFA factors can be predicted
 from individual omics views. This is useful because the resulting predictor
-objects can subsequently be applied to external studies that have comparable
+objects can subsequently be applied to test studies that have comparable
 molecular measurements.
 
 ## Configure `mofa_train_glm_parameters.R`
@@ -748,11 +879,10 @@ Outputs are written to a `glm_model` folder alongside the fitted MOFA model:
 | `logs/mofa_train_glm.R` | Copy of the training script used. |
 | `logs/mofa_train_glm_parameters.R` | Copy of the parameter file used. |
 
-# External factor estimation for other studies
+# Factor estimation in test studies
 
-The repository contains two workflows specifically intended for external
-studies. These studies do **not** refit the MOFA model. Instead, they use the
-model artifacts learned in the primary study to estimate the corresponding MOFA
+The repository contains two workflows specifically intended for test studies. These studies do **not** refit the MOFA model. Instead, they use the
+model artifacts learned in the training study to estimate the corresponding MOFA
 factor values for new samples.
 
 There are two complementary approaches:
@@ -762,8 +892,8 @@ There are two complementary approaches:
 2. **Direct factor projection** with `project_mofa_factors.R`, using the
    `feature_weights.rds` object exported by `mofa_analysis.R`.
 
-Both approaches require the external study's data to be made comparable to the
-data used to learn the original MOFA factors. In particular, the external
+Both approaches require the test study's data to be made comparable to the
+data used to learn the original MOFA factors. In particular, the test-study
 omics matrices must use compatible feature identifiers and preprocessing,
 including the relevant normalization, transformations, change-score definition,
 and scaling conventions.
@@ -783,7 +913,7 @@ glm_model/mofa_glm_predictor.rds
 ```
 
 `glm_factor_estimate.R` loads this predictor object and applies the trained
-models to the external study's omics data.
+models to the test study's omics data.
 
 This is the preferred path when the training analysis has established that
 particular factors can be predicted adequately from particular molecular views,
@@ -802,19 +932,19 @@ The key settings are (most are analogous to the ones used in `mofa_parameters.R`
 | `subject_id_col` | Column name in the clinical/phenotype file containing subject identifiers. |
 | `treatment_col` | Column name in the clinical/phenotype file containing treatment codes. |
 | `timepoint_col` | Column name in the clinical/phenotype file containing timepoint codes. |
-| `timepoint_labels` | Mapping between external clinical timepoint codes and labels; includes the `baseline` definition. |
-| `treatment_labels` | Mapping between external clinical treatment codes and labels. |
-| `timepoint` | External-study visit to estimate factor values for. |
-| `use_change_scores` | Whether external data should be converted to target-minus-baseline change scores before prediction. This must match the definition used in the training workflow. |
-| `scale_views` | Whether external features should be z-score scaled before prediction. This must match the scale assumed by the trained predictor. |
-| `methy_fn`, `prot_fn`, `metab_data_fn`, `metab_annot_fn`, `clin_fn` | External-study input files. Comment out an omics file to exclude that view. |
-| `omics_input_defs` | External view definitions, including barcode columns and reader functions. The view names should match those used in the trained predictor. |
+| `timepoint_labels` | Mapping between test-study clinical timepoint codes and labels; includes the `baseline` definition. |
+| `treatment_labels` | Mapping between test-study clinical treatment codes and labels. |
+| `timepoint` | Test-study visit to estimate factor values for. |
+| `use_change_scores` | Whether test-study data should be converted to target-minus-baseline change scores before prediction. This must match the definition used in the training workflow. |
+| `scale_views` | Whether test-study features should be z-score scaled before prediction. This must match the scale assumed by the trained predictor. |
+| `methy_fn`, `prot_fn`, `metab_data_fn`, `metab_annot_fn`, `clin_fn` | Test-study input files. Comment out an omics file to exclude that view. |
+| `omics_input_defs` | Test-study view definitions, including barcode columns and reader functions. The view names should match those used in the trained predictor. |
 | `views` | Trained views to use, or `"all"`. |
 | `combine_views` | How to combine view-specific predictions for the same factor: `"mean"`, `"median"`, `"best_cv"`, or `"none"`. |
 | `metric_for_best_cv` | CV metric used when selecting the best view. |
 | `lambda_choice` | Optional override of the lambda value stored in each trained model. |
 
-The view-specific external input data are processed using the same general
+The view-specific test-study input data are processed using the same general
 clinical/timepoint/change-score conventions as the main MOFA workflow. Feature
 identifiers must match the identifiers used by the trained predictors.
 
@@ -829,21 +959,22 @@ Theprincipal outputs are:
 | `glm_factor_values.rds` | RDS version of the corresponding factor estimates. With combined views, this is a samples x factors matrix; with `combine_views = "none"`, it is a named list of view-specific samples x factors matrices. |
 | `sample_metadata.xlsx` | Sample metadata for the configured target visit, constructed with the same sample-ID convention as `mofa_analysis.R`. The worksheet is named using `study_name`. |
 | `sample_metadata.rds` | RDS version of the sample metadata table. |
-| `README.txt` | Run-specific description of the external scoring operation. |
+| `README.txt` | Run-specific description of the test-study scoring operation. |
 | `logs/sessionInfo.txt` | R session information. |
 | `logs/glm_factor_estimate.R` | Copy of the estimation script used. |
 | `logs/glm_factor_estimate_parameters.R` | Copy of the parameter file used. |
-| `logs/file_readers.R` | Reader functions used for the external data. |
-| `logs/methods.R` | Shared helper functions used for external-data preparation. |
+| `logs/file_readers.R` | Reader functions used for the test-study data. |
+| `logs/methods.R` | Shared helper functions used for test-study data preparation. |
 
-These estimated factor values can then be analyzed in the external study using
-its own clinical metadata and statistical workflow.
+These estimated factor values can then be analyzed with the test study's
+clinical metadata using `regress_mofa_factors.R`, as described in the
+test-study workflow below.
 
 ## B. Project factors directly using saved MOFA feature weights
 
-`project_mofa_factors.R` provides a second external-scoring strategy that does
+`project_mofa_factors.R` provides a second test-study scoring strategy that does
 not use the GLM predictor object. Instead, it reads the `feature_weights.rds`
-file created by `mofa_analysis.R` and projects the external study's molecular
+file created by `mofa_analysis.R` and projects the test study's molecular
 profiles onto the learned view-specific MOFA feature weights.
 
 The default projection is a regularized least-squares calculation. It should be
@@ -863,20 +994,20 @@ The key settings are (most are analogous to the ones used in `mofa_parameters.R`
 | `subject_id_col` | Column name in the clinical/phenotype file containing subject identifiers. |
 | `treatment_col` | EColumn name in the clinical/phenotype file containing treatment codes. |
 | `timepoint_col` | Column name in the clinical/phenotype file containing timepoint codes. |
-| `timepoint_labels` | Mapping between external timepoint codes and labels. |
-| `treatment_labels` | Mapping between external treatment codes and labels. |
-| `timepoint` | External-study visit to project. |
-| `use_change_scores` | Whether external omics data should be converted to target-minus-baseline change scores. This must match the original MOFA preprocessing. |
-| `scale_views` | Whether external features are z-score scaled before projection. This must match the original preprocessing scale. |
-| `methy_fn`, `prot_fn`, `metab_data_fn`, `metab_annot_fn`, `clin_fn` | External input files. |
-| `omics_input_defs` | Definitions of the external omics views. View names must match the names in `feature_weights.rds`. |
+| `timepoint_labels` | Mapping between test-study timepoint codes and labels. |
+| `treatment_labels` | Mapping between test-study treatment codes and labels. |
+| `timepoint` | Test-study visit to project. |
+| `use_change_scores` | Whether test-study omics data should be converted to target-minus-baseline change scores. This must match the original MOFA preprocessing. |
+| `scale_views` | Whether test-study features are z-score scaled before projection. This must match the original preprocessing scale. |
+| `methy_fn`, `prot_fn`, `metab_data_fn`, `metab_annot_fn`, `clin_fn` | Test-study input files. |
+| `omics_input_defs` | Definitions of the test-study omics views. View names must match the names in `feature_weights.rds`. |
 | `combine_views` | How view-specific projections are combined: `"mean"`, `"median"`, `"best_cv"`, `"weighted_cv"`, or `"none"`. |
 | `metric` | Internal-CV metric used by `best_cv` or `weighted_cv`. |
 | `ridge_lambda` | Ridge regularization strength used in the feature-weight projection. Positive values generally improve numerical stability. |
 | `verbose` | Whether projection progress messages are printed. |
 
 The direct-projection workflow is particularly sensitive to preprocessing
-compatibility. The external data should be put on the same scale as the data
+compatibility. The test-study data should be put on the same scale as the data
 used to learn the original MOFA model, including the same transformations,
 normalization, feature identifiers, change-score definition, and any required
 z-scoring.
@@ -896,58 +1027,59 @@ outputs are:
 | `logs/sessionInfo.txt` | R session information. |
 | `logs/project_mofa_factors.R` | Copy of the projection script used. |
 | `logs/project_mofa_factors_parameters.R` | Copy of the projection parameter file used. |
-| `logs/file_readers.R` | Reader functions used for the external data. |
-| `logs/methods.R` | Shared helper functions used for external-data preparation. |
+| `logs/file_readers.R` | Reader functions used for the test-study data. |
+| `logs/methods.R` | Shared helper functions used for test-study data preparation. |
 
 # Recommended end-to-end workflow
 
-For a new study, the intended workflow is:
+For a training study fitting new MOFA models, the recommended workflow is:
 
-1. **Configure and run `mofa_analysis.R`.** Edit `mofa_parameters.R` to define
-   the study-specific clinical columns, input files, target visit, and omics
-   views. The result folder contains the fitted `model.hdf5`, factor values,
-   feature weights, and sample metadata. Its `logs` subfolder contains the
-   model-training log, session information, and source/configuration files used
-   for the run.
-2. **Configure and run `regress_mofa_factors.R`.** Edit
-   `regression_parameters.R` to select either the fitted MOFA model or 
-   persisted metadata/factor-value files, set `sample_id_col`, and specify `Y`,
-   `X`, and `categorical`. Review both sets of regression PDF reports and the
-   consolidated `regression_model_summary.xlsx`/`.rds` model summaries.
-3. **Configure and run `mofa_train_glm.R`.** Edit
-   `mofa_train_glm_parameters.R` to point to the `model.hdf5` file and select
-   the factors/views to evaluate. Use the training report and internal-CV
-   metrics to assess view-specific predictability and retain the resulting
-   `mofa_glm_predictor.rds`.
-4. **Optionally render `mofa_plots_report.Rmd`.** Edit
-   `mofa_plots_report_parameters.R` to point to the fitted `model.hdf5` and
-   select the factors, metadata variables, views, feature-weight, heatmap, and
-   dimensionality-reduction settings of interest.
-5. **Optionally configure and run `mofa_factor_interpretation.R`.** Edit
-   `mofa_factors_interpretation_parameters.R` to identify the fitted MOFA model,
-   select the factors/views and GO ontologies to analyze, set enrichment/report
-   thresholds, and configure parallelization. Review the generated enrichment
-   workbook and optional PDF interpretation report.
+1. **Check the R environment.** Run `check_environment.R` as described under
+   [Required R packages](#required-r-packages), install missing dependencies,
+   and review any calls it could not resolve.
+2. **Configure the automated workflow.** Define the clinical data, all available
+   omics views, and other study settings in `mofa_parameters.R`; set regression
+   and GLM training options in `regression_parameters.R` and
+   `mofa_train_glm_parameters.R`. List all nonempty view combinations in
+   `configure_runs.txt`.
+3. **Run `run_mofa_workflow.R`.** For each listed combination, it fits MOFA,
+   runs factor regression, and trains GLM predictors. Review
+   `workflow_summary_*.csv` for step statuses and errors, and inspect each
+   run's outputs and logs.
+4. **Review and share results.** Compare factors and their clinical associations
+   across fits, and review the GLM validation metrics. For factors of interest,
+   provide test studies with the relevant `mofa_glm_predictor.rds` and/or
+   `feature_weights.rds`, along with the feature identifiers and preprocessing
+   information needed to use them.
+5. **Optionally visualize and interpret selected fits.** Configure and render
+   `mofa_plots_report.Rmd` and/or configure and run
+   `mofa_factor_interpretation.R` for the fitted models of interest.
 
-## External-study workflow
+The individual scripts may also be configured and run independently; the
+sections above describe their parameters, inputs, and outputs. The automated
+workflow uses those same scripts and leaves the optional reporting steps to the
+analyst.
+
+## Test-study workflow
 
 Once the primary MOFA study has produced `mofa_glm_predictor.rds` and/or
-`feature_weights.rds`, an external study can estimate the same learned factor
+`feature_weights.rds`, a test study can estimate the same learned factor
 values without refitting MOFA:
 
-1. Obtain the model artifact from the primary study (`mofa_glm_predictor.rds`
+1. Check the R environment as described under [Required R packages](#required-r-packages).
+2. Obtain the model artifact from the training study (`mofa_glm_predictor.rds`
    for GLM/LASSO estimation, or `feature_weights.rds` for direct projection).
-2. Prepare the external omics data using the same feature identifiers and the
-   same preprocessing conventions used by the primary study.
-3. Configure either `glm_factor_estimate_parameters.R` or
-   `project_mofa_factors_parameters.R` with the external clinical and omics
+3. Prepare the test-study omics data using the same feature identifiers and the
+   same preprocessing conventions used by the training study.
+4. Configure either `glm_factor_estimate_parameters.R` or
+   `project_mofa_factors_parameters.R` with the test-study clinical and omics
    files.
-4. Run the corresponding estimation script.
-5. Use the resulting samples x factors matrix in the external study's own
+5. Run the corresponding estimation script.
+6. Use the resulting samples x factors matrix in the test study's own
    statistical analyses, while retaining the generated `logs` folder and
    `README.txt` for provenance.
-6. **Configure and run `regress_mofa_factors.R`** to test associations between the
-   externally estimated factors and the external study's metadata. In
+7. **Configure and run `regress_mofa_factors.R`** to test associations between the
+   factors estimated in the test study and its metadata. In
    `regression_parameters.R`, select the persisted-file input mode, set
    `sample_metadata_fname` to the generated `sample_metadata.xlsx` or `.rds`
    file, and set `factor_values_fname` to the generated
@@ -961,4 +1093,4 @@ estimation applies a supervised predictor learned from the original MOFA
 factor values and provides CV-based view-selection options. Direct projection
 uses the original MOFA feature weights and a regularized projection formula.
 Neither method refits the original MOFA model, and both require careful
-harmonization of the external data with the original training scale.
+harmonization of the test-study data with the original training scale.

@@ -1,0 +1,11 @@
+# One comma-separated list of omics_input_defs names per run.
+# Define the file paths for every requested view in mofa_parameters.R first.
+# Examples (uncomment and edit to select your runs):
+
+#methylation, proteomics, metabolomics
+#methylation, proteomics
+#methylation , metabolomics
+#proteomics, metabolomics
+#methylation
+#proteomics
+#metabolomics

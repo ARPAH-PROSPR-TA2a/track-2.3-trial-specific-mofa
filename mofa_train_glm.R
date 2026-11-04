@@ -22,6 +22,12 @@
 # functions scoped to the environment in which this script is sourced.
 source("mofa_train_glm_parameters.R", local = TRUE)
 
+# Optional input supplied by run_mofa_workflow.R after reading parameters.
+if (exists(".mofa_model_override", inherits = FALSE)) {
+  mofa_res_fname <- .mofa_model_override
+}
+
+
 #' Train LASSO/elastic-net predictors of MOFA factor values
 #'
 #' This function trains view-specific penalized regression models that predict

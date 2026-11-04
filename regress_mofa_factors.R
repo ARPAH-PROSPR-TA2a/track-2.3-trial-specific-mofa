@@ -54,6 +54,14 @@ library(MOFA2)
 # current working directory before this statement is evaluated.
 source("regression_parameters.R", local = TRUE)
 
+# Optional input supplied by run_mofa_workflow.R after reading parameters.
+if (exists(".mofa_model_override", inherits = FALSE)) {
+  mofa_res_fname <- .mofa_model_override
+  sample_metadata_fname <- NULL
+  factor_values_fname <- NULL
+}
+
+
 # Normalize an optional path setting. NULL and an empty string both mean that
 # the corresponding input has not been specified.
 normalizeOptionalPath <- function(x, setting_name) {
