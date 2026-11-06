@@ -49,10 +49,12 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
   # original line numbers are retained for diagnostics and the output summary.
   if (!file.exists(config_file)) stop("Cannot find configuration: ", config_file)
   lines <- readLines(config_file, warn = FALSE, encoding = "UTF-8")
+  
   # Remove a possible UTF-8 byte-order mark, and ignore comments/blank lines.
   lines <- sub("^\ufeff", "", lines)
   indices <- which(nzchar(trimws(lines)) & !grepl("^\\s*#", lines))
   if (!length(indices)) stop("No view combinations found in ", config_file)
+  
   # Parse each remaining line into a character vector of view names. Trim
   # whitespace and reject empty or duplicate entries within a combination.
   runs <- lapply(indices, function(i) {
@@ -64,7 +66,8 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
     if (anyDuplicated(fields)) stop("Duplicate view name on line ", i)
     fields
   })
-  # Sort only for comparison: combinations with the same views in different
+  
+# Sort only for comparison: combinations with the same views in different
   # orders count as duplicates. The original order is retained for execution.
   run_keys <- vapply(runs, function(x) paste(sort(x), collapse = "\r"), "")
   if (anyDuplicated(run_keys)) stop("The same combination appears more than once.")
@@ -76,6 +79,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
   sys.source("file_readers.R", envir = settings)
   sys.source("mofa_parameters.R", envir = settings)
   sys.source("methods.R", envir = settings)
+  
   # Check definitions and requested names against the parameter file. Validate
   # every requested combination before committing time to any MOFA run.
   settings$validateOmicsInputDefinitions(settings$omics_input_defs)
@@ -84,6 +88,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
     stop("omics_input_defs must have unique, non-empty names.")
   unknown <- setdiff(unique(unlist(runs)), view_names)
   if (length(unknown)) stop("Unknown view name(s): ", paste(unknown, collapse = ", "))
+  
   # Each view definition names a variable containing its input path. Require
   # that variable to be defined in the parameter environment itself, and check
   # that it names an existing file. Custom readers may require additional files,
@@ -98,6 +103,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
         !nzchar(trimws(path)) || !file.exists(path) || dir.exists(path))
       stop("Invalid or missing input file for view '", view, "': ", paste(path, collapse = ", "))
   }
+  
   # Create the common output directory if necessary. Each individual workflow
   # still creates its usual results and logs under this directory.
   if (!is.character(settings$output_dir) || length(settings$output_dir) != 1L ||
@@ -107,6 +113,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
   if (!dir.exists(settings$output_dir)) stop("Cannot create output_dir.")
   # tempfile avoids summary collisions when batches are started close together.
   summary_file <- tempfile("workflow_summary_", tmpdir = settings$output_dir, fileext = ".csv")
+  
   # Initialize one row per combination. Persist the summary now and after each
   # step, so completed work and errors remain visible if a later step fails.
   summary <- data.frame(line = indices, views = vapply(runs, paste, "", collapse = ", "),
@@ -123,6 +130,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
   for (i in seq_along(runs)) {
     message("Starting run ", i, "/", length(runs), ": ", summary$views[i])
     analysis <- new.env(parent = globalenv())
+	
     # The analysis script recognizes this private variable and selects exactly
     # these views instead of using all views with configured paths. On success,
     # it places the path to its model.hdf5 file in .mofa_run_model.
@@ -133,6 +141,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
           !file.exists(analysis$.mofa_run_model)) stop("MOFA model was not produced.")
       NULL
     }, error = function(e) conditionMessage(e))
+
     # A missing or failed MOFA model prevents both downstream steps. Record
     # the error and move directly to the next configured combination.
     if (!is.null(err)) {
@@ -144,6 +153,7 @@ runMofaWorkflow <- function(config_file = "configure_runs.txt") {
     summary$mofa[i] <- "completed"
     summary$model_file[i] <- analysis$.mofa_run_model
     save_summary()
+	
     # Pass the exact model path to each downstream script through a private
     # override variable. Each script applies the override after sourcing its
     # parameters, without changing the parameter file on disk. The regression

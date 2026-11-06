@@ -25,9 +25,8 @@
 
 # Location of directory where to store results and output - modify as desired
 # for your local run environment
-output_dir <- "D:/R_sessions/PROSPR/MOFA"
+output_dir <- "D:/R_sessions/PROSPR/MOFA/foo2"
 # output_dir <- "D:/R_sessions/PROSPR/MOFA/reliable_probes"
-# output_dir <- "D:/R_sessions/PROSPR/MOFA/foo"
 
 # Study name used in run-specific documentation.
 study_name <- "CALERIE"
@@ -53,43 +52,19 @@ treatment_labels <- setNames(c(0, 1), c("AL", "CR"))
 # Specify the target visit using one of the values in timepoint_labels.
 timepoint <- 24
 
-# If TRUE, compute (timepoint - baseline) change scores. If FALSE, use the
-# source data directly for samples where timepoint_col == timepoint.
-use_change_scores <- TRUE
-
-# Set scaling factor controlling how many features to retain per view
-# (relative to the smallest view) 
-max_factor <- 15
-
-# Set an absolute upper bound on the number of features per view - useful
-# primarily when running MOFA with only the methylation data view, to
-# avoid performance degradation due to hundreds of thousands of features
-max_features <- 15000
-
-# Indicates if the data should be scaled. According to the MOFA paper, scaling
-# is not needed. Scaling the data, however, may be helpful for some plots; for
-# example, clusters may be more distinguishable in heatmaps when using z-scores.
-scale_views <- TRUE
-
-# The maximum number of variational inference iterations allowed during model 
-# training in MOFA. The default value is 1000 but we use a higher setting in  
-# case it is required for convergence. A small value can be entered here to
-# test code changes, so that the MOFA completes quickly.
-mofa_max_iter = 4000
-
 #------------------------------------------------------------------------------
 
 # *****************************************************************************
 # File locations. Edit according to your execution environment. 
 #
-# If you want to exclude one or more views from MOFA, simply comment the relevant 
-# file name variables.
+# If you run mofa_analysis.R as a standalone script and want to exclude one or 
+# more views from MOFA, simply comment the relevant file name variables. 
+# Otherwise, if executing the entirw MOFA workflow usinig the orchestrator 
+# script, run_mofa_workflow.R, do not comment anything out.
 # *****************************************************************************
 # Location of the methylation M-values file.
 methy_fn = file.path("E:/Data/PROSPR-FAST/CALERIE/methylation",
 		"GRSet_fully_filtered_bmiq_chunk_mvals.rds")
-#methy_fn = file.path("E:/Data/PROSPR-FAST/CALERIE/methylation",
-#		"CALERIE_GRSet_CPR_processing_reliable_subset_mvals.rds")
 
 # Location of the proteomics data file.
 prot_fn = file.path("E:/Data/PROSPR-FAST/CALERIE/proteomics",
@@ -183,11 +158,44 @@ omics_input_defs <- list(
 				reader = function(fn) readMetabolomics(fn)[["data"]],
 				readme_notes = list(
 						change_scores = paste("Metabolomics data in", study_name,
-								"are reported in Metabolon median-centered units; accordingly,",
+								"are reported in Metabolon median-scaled units; accordingly,",
 								"we log2 transform them prior to change-score calculation."),
 						timepoint_values = paste("Metabolomics data in", study_name,
-								"are reported in Metabolon median-centered units; accordingly,",
+								"are reported in Metabolon median-scaled units; accordingly,",
 								"we log2 transform them prior to analysis.")
 				)
 		)
 )
+
+
+
+# *****************************************************************************
+#
+# The values of the following parameters should be left to their default settings
+#
+# *****************************************************************************
+
+# If TRUE, compute (timepoint - baseline) change scores. If FALSE, use the
+# source data directly for samples where timepoint_col == timepoint.
+use_change_scores <- TRUE
+
+# Set scaling factor controlling how many features to retain per view
+# (relative to the smallest view) 
+max_factor <- 5
+
+# Set an absolute upper bound on the number of features per view - useful
+# primarily when running MOFA with only the methylation data view, to
+# avoid performance degradation due to hundreds of thousands of features
+max_features <- 10000
+
+# Indicates if the data should be scaled. According to the MOFA paper, scaling
+# is not needed. Scaling the data, however, may be helpful for some plots; for
+# example, clusters may be more distinguishable in heatmaps when using z-scores.
+scale_views <- TRUE
+
+# The maximum number of variational inference iterations allowed during model 
+# training in MOFA. The default value is 1000 but we use a higher setting in  
+# case it is required for convergence. A small value can be entered here to
+# test code changes, so that the MOFA completes quickly.
+mofa_max_iter = 4000
+

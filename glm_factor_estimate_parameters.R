@@ -37,15 +37,6 @@ treatment_labels <- setNames(c(0, 1), c("AL", "CR"))
 # Target visit to score.
 timepoint <- 24
 
-# If TRUE, compute target-minus-baseline change scores. If FALSE, use target
-# visit values directly.
-use_change_scores <- TRUE
-
-# If TRUE, z-score each retained feature across the selected external samples
-# before GLM prediction. Set this consistently with the preprocessing scale used
-# to construct the training predictor.
-scale_views <- TRUE
-
 # -----------------------------------------------------------------------------
 # Input file locations. Comment out a view-specific file variable to exclude it.
 # -----------------------------------------------------------------------------
@@ -111,6 +102,22 @@ omics_input_defs <- list(
     )
   )
 )
+
+
+# *****************************************************************************
+#
+# The values of the following parameters should be left to their default settings
+#
+# *****************************************************************************
+
+# If TRUE, compute target-minus-baseline change scores. If FALSE, use target
+# visit values directly.
+use_change_scores <- TRUE
+
+# If TRUE, z-score each retained feature across the selected external samples
+# before GLM prediction. Set this consistently with the preprocessing scale used
+# to construct the training predictor.
+scale_views <- TRUE
 
 # -----------------------------------------------------------------------------
 # predictMofaFactorScores() settings.

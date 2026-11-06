@@ -11,6 +11,19 @@ mofa_res_fname <- file.path("D:/R_sessions/PROSPR/MOFA",
 		"2026_Oct_06_00_59_11_visit=24mo_change_scores_views=me+pr+mb",
 		"model.hdf5")
 
+# Parallelize independent view/factor models using future.apply. Parallelization
+# occurs across view/factor combinations; repeated CV within each worker remains
+# serial.
+use_parallel <- TRUE
+n_workers <- 30 #max(1L, parallel::detectCores() - 5L)
+
+
+# *****************************************************************************
+#
+# The values of the following parameters should be left to their default settings
+#
+# *****************************************************************************
+
 # MOFA factors to evaluate. Use "all" to train predictors for every factor, or
 # provide a character vector such as c("Factor1", "Factor2").
 factors <- "all"
@@ -50,12 +63,6 @@ nfolds <- 10
 # predictor.
 min_samples <- 10
 min_features <- 2
-
-# Parallelize independent view/factor models using future.apply. Parallelization
-# occurs across view/factor combinations; repeated CV within each worker remains
-# serial.
-use_parallel <- TRUE
-n_workers <- 30 #max(1L, parallel::detectCores() - 5L)
 
 # Print progress messages while models are trained.
 verbose <- TRUE
