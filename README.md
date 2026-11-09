@@ -102,6 +102,8 @@ provides a concise checklist for each study mode.
 | `glm_factor_estimate.R` | Estimates learned MOFA factor values in a test-study dataset using the view-specific GLM/LASSO predictors trained by `mofa_train_glm.R`. |
 | `project_mofa_factors_parameters.R` | Configuration file for projecting a test-study dataset directly onto learned MOFA feature weights. |
 | `project_mofa_factors.R` | Estimates MOFA factor values in a test-study dataset by applying saved MOFA feature weights to the corresponding test-study omics views. |
+| `package_results_parameters.R` | Configures the results directory (`root_dir`), output `.tar.gz` archive (`gzip_res_file`), and glob-based exclusions (`exclude_files`) used to omit analysis files containing subject-level clinical and omics data from archives prepared for sharing. |
+| `package_results.R` | Packages training- or test-study results into a compressed `.tar.gz` archive while preserving the directory structure and applying configured exclusions to prevent specified subject-level clinical and omics data files from being included in the archive prepared for sharing. |
 
 ## Required R packages
 
@@ -200,7 +202,7 @@ you should input methylation data as M-values, and log-transform both proteomics
 and metabolomics data. Please follow our separate preprocessing guidelines 
 when preparing each matrix.
 
-# Automated  worklfow execution: the recommended approach
+# Automated  workflow execution: the recommended approach
 
 Use `run_mofa_workflow.R` to run MOFA fitting, factor regression, and GLM
 training in sequence for each combination explicitly listed in `configure_runs.txt`. 
@@ -290,7 +292,7 @@ Rscript.exe -e "source('/path_to_mofa_files/mofa_analysis.R', local = TRUE, chdi
 ```
 
 In the case of `mofa_analysis.R`, running from an R session is recommended 
-to capture the MOFA training output, due to the pythong environment dependency,
+to capture the MOFA training output, due to the python environment dependency,
 as mentioned above.
 
 The individual scripts making up the MOFA analysis workflow are described in the
@@ -981,7 +983,7 @@ The key settings are (most are analogous to the ones used in `mofa_parameters.R`
 | `omics_input_defs` | Definitions of omics view properties for the test study, including barcode columns and reader functions. The view names should match those used in the trained predictor. |
 | `study_name` | Study name used in generated documentation and Excel sheet names. |
 | `subject_id_col` | Column name in the clinical file containing subject identifiers. |
-| `treatment_col` | EColumn name in the clinical file containing treatment codes. |
+| `treatment_col` | Column name in the clinical file containing treatment codes. |
 | `timepoint_col` | Column name in the clinical file containing timepoint codes. |
 | `timepoint_labels` | Mapping between test-study timepoint codes and labels. |
 | `treatment_labels` | Mapping between test-study treatment codes and labels. |
@@ -1048,6 +1050,11 @@ For a training study fitting new MOFA models, the recommended workflow is:
 6. **Optionally visualize and interpret selected fits.** Configure and render
    `mofa_plots_report.Rmd` and/or configure and run
    `mofa_factor_interpretation.R` for the fitted models of interest.
+7. **Package training-study results for sharing.** Configure `root_dir` and,
+   if needed, `gzip_res_file` in `package_results_parameters.R`and run 
+   `package_results.R` to create a `.tar.gz` archive of the results. The
+   archive preserves the folder structure and excludes analysis files containing
+   subject-level clinical and omics data.
 
 ## Test-study workflow
 
@@ -1076,6 +1083,11 @@ values without refitting MOFA:
    `mofa_factor_projection.xlsx`/`.rds` file. This direct input requires a
    single samples x factors matrix; view-specific outputs produced with
    `combine_views = "none"` must first be selected or combined.
+8. **Package test-study results for sharing.** Configure `root_dir` and,
+   if needed, `gzip_res_file` in `package_results_parameters.R`and run 
+   `package_results.R` to create a `.tar.gz` archive of the results. The
+   archive preserves the folder structure and excludes analysis files containing
+   subject-level clinical and omics data.
 
 The two methods answer slightly different operational needs. GLM/LASSO
 estimation applies a supervised predictor learned from the original MOFA
