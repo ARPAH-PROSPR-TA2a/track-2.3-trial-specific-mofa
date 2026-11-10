@@ -1,18 +1,19 @@
-# Check packages used by R scripts in this directory.
+# Check packages used by R scripts and R Markdown documents in this directory.
 # Run from RGui with:
 #   source("path_to_code/check_environment.R", local = TRUE, chdir = TRUE)
 #
-# Files are parsed, not executed. Only .R/.r files in this directory are
-# inspected; subdirectories and R Markdown files are not inspected. Package
+# Files are parsed, not executed. .R and .Rmd files in this directory are
+# inspected, including R code chunks in .Rmd files; subdirectories, inline R
+# expressions, chunk options, and YAML headers are not inspected. Package
 # names must appear literally in library(), require(), requireNamespace(),
 # loadNamespace(), ::, or ::: calls. Computed names cannot be determined
 # reliably without executing the code and are reported for manual review.
 # Conditional calls are included even if their condition would be false.
 
 local({
-  r_files <- list.files(".", pattern = "\\.[Rr]$", full.names = TRUE)
+  r_files <- list.files(".", pattern = "\\.(r|rmd)$", full.names = TRUE, ignore.case = TRUE)
   if (length(r_files) == 0L) {
-    cat("No R files found in:", normalizePath("."), "\n")
+    cat("No R or R Markdown files found in:", normalizePath("."), "\n")
     return(invisible(NULL))
   }
 
@@ -76,12 +77,67 @@ local({
     invisible(NULL)
   }
 
-  for (file in r_files) {
-    parsed <- tryCatch(parse(file = file, keep.source = FALSE), error = function(e) {
-      parse_failures <<- c(parse_failures, paste0(basename(file), ": ", conditionMessage(e)))
+  # Parse each code block independently, so an error in one R Markdown chunk
+  # does not prevent checking the others. Report its starting line for review.
+  inspect_code <- function(code, label) {
+    parsed <- tryCatch(parse(text = code, keep.source = FALSE), error = function(e) {
+      parse_failures <<- c(parse_failures, paste0(label, ": ", conditionMessage(e)))
       NULL
     })
-    if (!is.null(parsed)) inspect(parsed, file)
+    if (!is.null(parsed)) inspect(parsed, label)
+  }
+
+  # Identify fenced Markdown blocks and inspect only those with an R engine.
+  # Both backtick and tilde fences are supported, including longer fences.
+  inspect_rmd <- function(file) {
+    lines <- readLines(file, warn = FALSE)
+    in_block <- FALSE
+    r_block <- FALSE
+    fence_char <- ""
+    fence_length <- 0L
+    code <- character()
+    start_line <- 0L
+
+    for (i in seq_along(lines)) {
+      line <- lines[i]
+      if (!in_block) {
+        opening <- regmatches(line, regexec("^ {0,3}(`{3,}|~{3,})(.*)$", line))[[1L]]
+        if (length(opening)) {
+          in_block <- TRUE
+          fence <- opening[2L]
+          fence_char <- substr(fence, 1L, 1L)
+          fence_length <- nchar(fence)
+          r_block <- grepl("^[[:space:]]*\\{[[:space:]]*[rR]([[:space:],}]|$)", opening[3L])
+          code <- character()
+          start_line <- i
+        }
+      } else {
+        closing_pattern <- paste0("^ {0,3}", fence_char, "{", fence_length,
+                                  ",}[[:space:]]*$")
+        if (grepl(closing_pattern, line)) {
+          if (r_block) inspect_code(code, paste0(file, " (chunk starting at line ", start_line, ")"))
+          in_block <- FALSE
+        } else if (r_block) {
+          code <- c(code, line)
+        }
+      }
+    }
+    if (in_block && r_block) {
+      parse_failures <<- c(parse_failures, paste0(basename(file),
+        ": R chunk starting at line ", start_line, " has no closing fence."))
+    }
+  }
+
+  for (file in r_files) {
+    tryCatch({
+      if (grepl("\\.rmd$", file, ignore.case = TRUE)) {
+        inspect_rmd(file)
+      } else {
+        inspect_code(readLines(file, warn = FALSE), file)
+      }
+    }, error = function(e) {
+      parse_failures <<- c(parse_failures, paste0(basename(file), ": ", conditionMessage(e)))
+    })
   }
 
   packages <- sort(unique(packages))
@@ -90,7 +146,7 @@ local({
   installed <- rownames(utils::installed.packages(lib.loc = .libPaths()))
   missing <- setdiff(packages, installed)
 
-  cat("Checked", length(r_files), "R file(s) in", normalizePath("."), "\n")
+  cat("Checked", length(r_files), "R or R Markdown file(s) in", normalizePath("."), "\n")
   if (length(missing)) {
     cat("\nMissing packages:", paste(missing, collapse = ", "), "\n")
     cat("To install them, run:\n")
@@ -107,7 +163,7 @@ local({
     cat(paste0("  ", unique(unresolved), collapse = "\n"), "\n", sep = "")
   }
   if (length(parse_failures)) {
-    cat("\nThe following files could not be parsed and were not checked:\n")
+    cat("\nThe following files or code chunks could not be checked:\n")
     cat(paste0("  ", parse_failures, collapse = "\n"), "\n", sep = "")
   }
   if (length(unresolved) || length(parse_failures)) {
