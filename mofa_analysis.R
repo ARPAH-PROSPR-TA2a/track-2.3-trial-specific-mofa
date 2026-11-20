@@ -319,36 +319,58 @@ console_log_folder <- log_folder
 # continue to go to console_out.txt. Restore the output sink even on error.
 sink(file = log_file)
 mo.tr <- tryCatch({
-        fitted_model <- run_mofa(mo, res_file, use_basilisk = TRUE)
+        fitted_model <- tryCatch(
+          run_mofa(mo, res_file, use_basilisk = TRUE),
+          error = function(e) {
+            msg <- conditionMessage(e)
+            if (grepl("mofapy2.*(entry_point|run\\.entry_point)", msg, ignore.case = TRUE)) {
+              stop("MOFA2 could not load the mofapy2 entry point in its basilisk environment: ",
+                   msg, "\nCheck the MOFA2, basilisk, reticulate and mofapy2 versions ",
+                   "and use a compatible MOFA2/Bioconductor installation. ",
+                   "An import in the calling R session may not affect the basilisk process.",
+                   call. = FALSE)
+            }
+            stop(e)
+          }
+        )
         MOFA2:::.quality_control(fitted_model)
         fitted_model
     }, finally = sink())
 
-# Export fitted factor values, feature weights, and sample metadata in both
-# Excel and RDS formats. Excel workbooks are written with the xlsx package.
+# Persist the machine-readable results first, so a later Excel failure does not
+# discard the files needed for downstream projection and regression.
 factor_values <- get_factors(mo.tr)[[1]]
-factor_values_xlsx <- file.path(res_folder, "factor_values.xlsx")
-xlsx::write.xlsx(as.data.frame(factor_values), factor_values_xlsx,
-		sheetName = study_name, row.names = TRUE)
-saveRDS(factor_values, file.path(res_folder, "factor_values.rds"))
-
 view_names <- views_names(mo.tr)
-feature_weights <- setNames(lapply(view_names, function(view_name){
-			get_weights(mo.tr)[[view_name]]
-		}), view_names)
-feature_weights_xlsx <- file.path(res_folder, "feature_weights.xlsx")
-for (i in seq_along(feature_weights)){
-	xlsx::write.xlsx(as.data.frame(feature_weights[[i]]), feature_weights_xlsx,
-			sheetName = names(feature_weights)[i], row.names = TRUE,
-			append = i > 1)
-}
-saveRDS(feature_weights, file.path(res_folder, "feature_weights.rds"))
-
+feature_weights <- setNames(lapply(view_names, function(view_name) {
+  get_weights(mo.tr)[[view_name]]
+}), view_names)
 sample_metadata <- samples_metadata(mo.tr)
-sample_metadata_xlsx <- file.path(res_folder, "sample_metadata.xlsx")
-xlsx::write.xlsx(as.data.frame(sample_metadata), sample_metadata_xlsx,
-		sheetName = study_name, row.names = FALSE)
+saveRDS(factor_values, file.path(res_folder, "factor_values.rds"))
+saveRDS(feature_weights, file.path(res_folder, "feature_weights.rds"))
 saveRDS(sample_metadata, file.path(res_folder, "sample_metadata.rds"))
+
+# Build one workbook in memory and save it once, avoiding repeated loading of 
+# preceding sheets.
+xlsx::write.xlsx(as.data.frame(factor_values), file.path(res_folder, "factor_values.xlsx"),
+                 sheetName = study_name, row.names = TRUE)
+feature_weights_xlsx <- file.path(res_folder, "feature_weights.xlsx")
+tryCatch({
+  wb <- xlsx::createWorkbook(type = "xlsx")
+  for (view_name in names(feature_weights)) {
+    sheet <- xlsx::createSheet(wb, sheetName = view_name)
+    xlsx::addDataFrame(as.data.frame(feature_weights[[view_name]]), sheet,
+                       row.names = TRUE)
+  }
+  xlsx::saveWorkbook(wb, feature_weights_xlsx)
+}, error = function(e) {
+  stop("Could not write feature_weights.xlsx: ", conditionMessage(e),
+       "\nThe RDS outputs have already been saved. If Java ran out of heap, ",
+       "start a fresh R session and set options(java.parameters = '-Xmx4g') ",
+       "before loading xlsx or rJava; adjust the heap for available RAM.",
+       call. = FALSE)
+})
+xlsx::write.xlsx(as.data.frame(sample_metadata), file.path(res_folder, "sample_metadata.xlsx"),
+                 sheetName = study_name, row.names = FALSE)
 
 # Logging/provenance - write the R session information and copy the analysis
 # script, file-reader file, methods file, and parameters file used for the run.
