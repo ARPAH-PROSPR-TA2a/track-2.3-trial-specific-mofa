@@ -105,6 +105,20 @@ provides a concise checklist for each study mode.
 | `package_results_parameters.R` | Configures the results directory (`root_dir`), output `.tar.gz` archive (`gzip_res_file`), and glob-based exclusions (`exclude_files`) used to omit analysis files containing subject-level clinical and omics data from archives prepared for sharing. |
 | `package_results.R` | Packages training- or test-study results into a compressed `.tar.gz` archive while preserving the directory structure and applying configured exclusions to prevent specified subject-level clinical and omics data files from being included in the archive prepared for sharing. |
 
+## R environment
+
+Before installing the packages required by this workflow, we recommend using a 
+current version of R and the corresponding compatible release of Bioconductor. 
+Keeping these environments up to date can help avoid compatibility problems 
+among MOFA2 and its dependencies, including `basilisk`, `reticulate`, and the 
+Python package `mofapy2`. After updating R, ensure that the required packages 
+are installed or updated for the new R environment.
+
+Because MOFA2 relies on a Python environment managed by `basilisk`, updating R 
+and Bioconductor alone may not resolve every Python compatibility issue. If 
+MOFA training fails with a `mofapy2` error, check the installed package versions 
+and the MOFA2 installation documentation.
+
 ## Required R packages
 
 Before running the workflow, run the following script from the R session you 
@@ -153,6 +167,18 @@ MOFA2 uses the Python package `mofapy2` under the hood. The main MOFA script
 runs MOFA with `use_basilisk = TRUE`, allowing `basilisk` to manage the Python
 environment. The first run on a new machine may therefore take longer while
 the required dependencies are installed.
+
+For large models, Excel exports can require substantial Java heap memory. If
+an export fails because Java runs out of heap, start a fresh R session and set
+an appropriate limit **before** loading `xlsx`, `rJava`, or another package
+that initializes Java. For example:
+
+```r
+options(java.parameters = "-Xmx4g")
+```
+
+Choose a limit appropriate for the memory available on the computer; a larger
+heap is not required for every dataset or environment.
 
 ## Repository organization and study-specific configuration
 
@@ -425,6 +451,12 @@ MOFA groups.
 Each run creates a timestamped folder beneath `output_dir`. The exact
 folder name records the run time, target visit, score mode, and included views.
 
+The factor values, feature weights, and sample metadata are saved as RDS
+files before Excel export. This preserves those machine-readable outputs if a
+later workbook export fails. The feature-weight workbook is assembled in
+memory and saved once, and may still require substantial Java heap for a
+large model.
+
 The principal outputs are:
 
 | Output | Description |
@@ -643,6 +675,16 @@ The most important settings to specify are:
 | `use_parallel` | TRUE of FALSE. Indicates whether independent view/factor predictor jobs are run in parallel. It is recommended to set to TRUE. The analysis can be computationally intensive; distributing work across multiple processors can significantly accelerate the completion time. |
 | `n_workers` | Number of parallel worker processes to use, when `use_parallel` is set to TRUE. |
 
+Each parallel worker runs as a separate Rscript.exe session and requires memory 
+for instantiating the base R environment, loading needed packages, as well as 
+for its input data and model fitting.
+Choose `n_workers` based on both available CPUs and RAM. The code avoids
+capturing the full MOFA model in the worker environment, but large input
+matrices can still exceed the configured `future.globals.maxSize` limit. If
+necessary, a user can raise this limit before running the script, for example
+`options(future.globals.maxSize = 4 * 1024^3)`; this does not itself reduce
+memory use.
+
 The values of the remaining parameters listed in 
 [`mofa_train_glm_parameters.R`](mofa_train_glm_parameters.R)
 should be left to their default settings.
@@ -711,6 +753,9 @@ view-specific enrichment analyses. The current implementation includes:
   and/or `"CC"`), so multiple-testing adjustment remains ontology-specific; and
 - Metabolon pathway/category over-representation analysis (ORA) for the
   positive and negative high-loading metabolite sets.
+
+For proteomics enrichment, feature identifiers must be UniProt accessions. If this 
+is not the case, proteomics enrichment analysis will be skipped.
 
 For the ranked analyses, the report uses the direction label `ranked`, because
 positive and negative loadings are analyzed together in one signed ranking.
