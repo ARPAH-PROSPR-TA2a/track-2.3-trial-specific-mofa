@@ -241,20 +241,45 @@ trainMofaFactorPredictor <- function(
   }
 
   if (use_parallel) {
-    # Save and restore the user's future plan so this function does not leave a
-    # global parallel backend behind after it returns.
-    old_plan <- future::plan()
-    on.exit(future::plan(old_plan), add = TRUE)
-    future::plan(future::multisession, workers = n_workers)
-
-    job_results <- future.apply::future_lapply(
-      X = seq_len(nrow(jobs)),
-      FUN = train_job,
-      future.seed = TRUE
-    )
+	  # Isolate the worker closure and its helpers from the sourcing environment,
+	  # which can otherwise retain the full MOFA object and unrelated run data.
+	  worker_env <- new.env(parent = globalenv())
+	  worker_names <- c("jobs", "X_by_view", "Y", "verbose", "outcome_type",
+			  "n_repeats", "train_frac", "split_seeds", "job_seeds",
+			  "alpha", "lambda_choice", "standardize", "nfolds",
+			  "min_samples", "min_features")
+	  for (nm in worker_names) worker_env[[nm]] <- get(nm, inherits = FALSE)
+	  
+	  helper_names <- c(".as_numeric_matrix", ".drop_all_na_sample_columns",
+			  ".train_one_view_factor_model", ".run_repeated_internal_cv",
+			  ".compute_prediction_metrics", ".summarize_metrics",
+			  ".extract_nonzero_coefficients", ".rbind_fill")
+	  for (nm in helper_names) {
+		  helper <- get(nm, mode = "function", inherits = TRUE)
+		  environment(helper) <- worker_env
+		  worker_env[[nm]] <- helper
+	  }
+	  environment(train_job) <- worker_env
+	  
+	  # Save and restore the user's future plan so this function does not leave a
+	  # global parallel backend behind after it returns.
+	  old_plan <- future::plan()
+	  on.exit(future::plan(old_plan), add = TRUE)
+	  future::plan(future::multisession, workers = n_workers)
+	  
+	  job_results <- future.apply::future_lapply(
+			  X = seq_len(nrow(jobs)),
+			  FUN = train_job,
+			  future.seed = TRUE,
+			  future.globals = FALSE,
+			  future.packages = c("stats", "glmnet")
+	  )
   } else {
-    job_results <- lapply(seq_len(nrow(jobs)), train_job)
+	  job_results <- lapply(seq_len(nrow(jobs)), train_job)
   }
+  
+  
+  
 
   # Reassemble flat job results into the nested results[[view]][[factor]] form
   # used by downstream prediction and reporting functions.
