@@ -438,10 +438,29 @@ map_uniprot_to_entrez <- function(uniprot_ids,
 	ids <- unique(na.omit(as.character(uniprot_ids)))
 	if (length(ids) == 0) return(tibble(feature = character(), ENTREZID = character(), SYMBOL = character()))
 	
+	# AnnotationDbi rejects a query when none of the supplied keys are known.
+	# Check against the installed database rather than guessing by ID format.
+	known_ids <- AnnotationDbi::keys(db, keytype = "UNIPROT")
+	valid_ids <- intersect(ids, known_ids)
+	if (!length(valid_ids)) {
+		warning("Proteomics enrichment will be skipped: none of the ", length(ids),
+				" feature identifiers are recognized as UNIPROT keys by ", OrgDb,
+				". Examples: ", paste(head(ids, 5L), collapse = ", "),
+				". Other eligible views will still be analyzed. Map assay identifiers ",
+				"(e.g. SOMAmer IDs) to UniProt accessions before fitting the model.",
+				call. = FALSE)
+		return(tibble(feature = character(), ENTREZID = character(), SYMBOL = character()))
+	}
+	if (length(valid_ids) < length(ids)) {
+		warning("Proteomics view: ", length(valid_ids), " of ", length(ids),
+				" feature identifiers were recognized as UNIPROT keys by ", OrgDb,
+				"; unrecognized examples: ", paste(head(setdiff(ids, valid_ids), 5L), collapse = ", "),
+				call. = FALSE)
+	}
 	suppressMessages({
 				mapped <- AnnotationDbi::select(
 						db,
-						keys = ids,
+						keys = valid_ids,
 						keytype = "UNIPROT",
 						columns = c("ENTREZID", "SYMBOL")
 				)
@@ -1462,12 +1481,20 @@ run_all_enrichments <- function(loadings,
                         distinct(feature, ENTREZID)
         }
 
+        # A view with no protein-to-gene mapping cannot contribute to ranked
+        # enrichment. Keep its loadings and feature tables for the rest of the
+        # report, but omit its enrichment tasks.
+        ranked_views <- c("proteomics", "expression", "methylation")
+        if (any(loadings$view == "proteomics") && nrow(proteomics_entrez_mapping) == 0L) {
+                ranked_views <- setdiff(ranked_views, "proteomics")
+        }
+
         # Precompute GO gene sets and descriptions separately for every requested
         # ontology. Keeping BP, MF, and CC in separate fgsea runs preserves
         # ontology-specific multiple-testing adjustment.
         go_pathways <- setNames(vector("list", length(go_ontology)), go_ontology)
         go_descriptions <- setNames(vector("list", length(go_ontology)), go_ontology)
-        if (any(loadings$view %in% c("proteomics", "expression", "methylation"))) {
+        if (any(loadings$view %in% ranked_views)) {
                 for (ontology_i in go_ontology) {
                         go_pathways[[ontology_i]] <- build_go_pathways_for_fgsea(
                                 OrgDb = OrgDb, ontology = ontology_i
@@ -1483,7 +1510,7 @@ run_all_enrichments <- function(loadings,
         # positive or negative direction from the sign of the NES, rather than from
         # separate input subsets.
         ranked_tasks <- loadings %>%
-                filter(view %in% c("proteomics", "expression", "methylation")) %>%
+                filter(view %in% ranked_views) %>%
                 distinct(view, factor) %>%
                 mutate(direction = "ranked")
 
@@ -2451,6 +2478,23 @@ run_mofa_integrative_interpretation <- function(mofa_obj,
 			fgsea_nproc = fgsea_nproc
 	)
 	
+	# Individual enrichment methods return different columns, and a run can
+	# legitimately yield no rows at all. Establish the columns required by the
+	# filter, consolidation, reports and export before referring to them.
+	needed_columns <- list(factor = character(), view = character(),
+			direction = character(), database = character(), ID = character(),
+			term = character(), Description = character(), geneID = character(),
+			selected_features_in_term = character(), p.adjust = numeric())
+	for (column_name in names(needed_columns)) {
+		if (!column_name %in% names(enrichment_results)) {
+			enrichment_results[[column_name]] <- rep(NA, nrow(enrichment_results))
+			storage.mode(enrichment_results[[column_name]]) <- typeof(needed_columns[[column_name]])
+		}
+	}
+	if (nrow(enrichment_results) == 0L) {
+		message("No enrichment results were returned; the report will contain no enrichment terms.")
+	}
+
 	# Apply the requested adjusted-p-value cutoff uniformly across enrichment
 	# methods. fgsea applies this cutoff internally, whereas metabolomics ORA does
 	# not, so filtering the combined results here ensures consistent behavior.
